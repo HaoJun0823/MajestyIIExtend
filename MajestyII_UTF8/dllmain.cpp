@@ -26,6 +26,8 @@
 
 #include "pch.h"
 #include <windows.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include "charlist_data.h"
 
 // ============================================================
@@ -146,6 +148,39 @@ static char* GbkToUtf8(const char* gbk, int len) {
     return out;
 }
 
+// ============================================================
+// 调试日志（诊断"还是英语"问题）
+// ============================================================
+static int g_dictLoaded = -1;   // -1=未加载 0=失败 1=成功
+static int g_dictCount = 0;
+
+static void LogWrite(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf_s(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    HANDLE h = CreateFileA("update\\hook_debug.log", GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    DWORD wr;
+    WriteFile(h, buf, (DWORD)strlen(buf), &wr, NULL);
+    CloseHandle(h);
+}
+
+// 记录 hook 命中情况（限制日志量避免刷爆）
+static void LogHookHit(const char* key, const char* res) {
+    static int count = 0;
+    if (count++ < 200) {
+        if (res)
+            LogWrite("HIT  key=[%s] -> [%s]\n", key, res);
+        else
+            LogWrite("MISS key=[%s]\n", key);
+    } else if (count == 201) {
+        LogWrite("...(log truncated)\n");
+    }
+}
+
 static void LoadDict(void) {
     // 优先从 DLL 所在目录加载词典（ASI 部署在 update\ 下，游戏 CWD 可能不是该目录）
     char dllDir[MAX_PATH] = {0};
@@ -166,10 +201,10 @@ static void LoadDict(void) {
     }
     if (h == INVALID_HANDLE_VALUE)
         h = CreateFileA(DICT_FILE, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) { LogWrite("LoadDict: FAILED to open dict (dllDir=[%s])\n", dllDir); return; }
 
     DWORD sz = GetFileSize(h, NULL);
-    if (sz == 0 || sz == 0xFFFFFFFF) { CloseHandle(h); return; }
+    if (sz == 0 || sz == 0xFFFFFFFF) { CloseHandle(h); LogWrite("LoadDict: FAILED size=%u\n", sz); return; }
     char* buf = (char*)HeapAlloc(GetProcessHeap(), 0, sz + 1);
     if (!buf) { CloseHandle(h); return; }
 
@@ -211,18 +246,22 @@ static void LoadDict(void) {
         if (copy) {
             memcpy(copy, val, vlen + 1);
             HashInsert(crc, copy);
+            g_dictCount++;
         }
     }
     if (toFree) HeapFree(GetProcessHeap(), 0, toFree);
     HeapFree(GetProcessHeap(), 0, buf);
+    g_dictLoaded = 1;
+    LogWrite("LoadDict: OK count=%d is_utf8=%d\n", g_dictCount, is_utf8);
 }
 
 static char* FindTextByKey(const char* key) {
-    if (!key) return NULL;
+    if (!key) { LogHookHit("(null)", NULL); return NULL; }
     DWORD crc = CalcCRC32(key);
     EnterCriticalSection(&g_cs);
     char* res = HashFind(crc);
     LeaveCriticalSection(&g_cs);
+    LogHookHit(key, res);
     return res;
 }
 
