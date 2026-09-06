@@ -147,7 +147,25 @@ static char* GbkToUtf8(const char* gbk, int len) {
 }
 
 static void LoadDict(void) {
-    HANDLE h = CreateFileA(DICT_FILE, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    // 优先从 DLL 所在目录加载词典（ASI 部署在 update\ 下，游戏 CWD 可能不是该目录）
+    char dllDir[MAX_PATH] = {0};
+    HMODULE hm = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&LoadDict, &hm)) {
+        GetModuleFileNameA(hm, dllDir, MAX_PATH);
+        char* slash = strrchr(dllDir, '\\');
+        if (slash) { slash[1] = '\0'; }
+    }
+
+    HANDLE h = INVALID_HANDLE_VALUE;
+    char fullPath[MAX_PATH];
+    if (dllDir[0]) {
+        lstrcpyA(fullPath, dllDir);
+        lstrcatA(fullPath, DICT_FILE);
+        h = CreateFileA(fullPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    }
+    if (h == INVALID_HANDLE_VALUE)
+        h = CreateFileA(DICT_FILE, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
 
     DWORD sz = GetFileSize(h, NULL);
@@ -219,10 +237,9 @@ void __declspec(naked) texts_hook() {
         push edx
         push edi
         push ebp
-        mov  ecx, [esp+0x24 + 16]
-        push ecx
+        push esi              ; key = 循环正在复制的源字符串（esi 由游戏设为 arg_4）
         call FindTextByKey
-        add  esp, 4              ; 清理 cdecl 参数 (push ecx) - 必须! 否则栈不平衡加载即runtime error
+        add  esp, 4           ; 清理 cdecl 参数 (push esi) - 必须! 否则栈不平衡加载即runtime error
         test eax, eax
         jz   no_change
         mov  esi, eax
@@ -488,7 +505,7 @@ static void ApplyHooks()
     HookCall(0x7E1A53, (DWORD)sub_70003810);
     HookCall(0x7E235D, (DWORD)sub_700037A0);
     PatchWord(0x7E1A2F, 0x9090);
-    // HookJmp(0x775939, (DWORD)texts_hook);  // [实验] 暂时禁用 texts_hook 隔离死循环归属
+    HookJmp(0x775939, (DWORD)texts_hook);
 }
 
 // ============================================================
