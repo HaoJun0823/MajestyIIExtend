@@ -275,8 +275,16 @@ static char* FindTextByKey(const char* key) {
 //   0x775939: movzx eax,byte ptr [esi]  ; ← hook 点（循环逐字符追加到 result）
 //   0x775940: push eax; operator+=; ...  ; 逐字符复制循环
 // 因此 0x775939 处 esi 是查池后的英文文本，直接 push esi 查 #UI_XXX 词典必然 MISS。
-// 正确取参：arg0(原始key) 在 [prologue后esp+0x54] = [push ebp/edx/edi/ebp后 esp+0x64]
-//   （原版 texts() 取 [esp+0x24+16]=[esp+0x34]，指向 var_2C=0xFFFFFFFF 垃圾 → CRC32 死循环）
+//
+// 栈偏移计算（arg_0 = 原始 key）：
+//   入口 esp=E（[E]=返回地址）；arg_0=[E+4]
+//   prologue: push 0xFFFFFFFF / push SEH / push eax → E-0xC
+//             sub esp,0x3C → E-0x48；push ebp → E-0x4C；push esi → E-0x50 (=帧基F)
+//   IDA: arg_0 = F+0x54 = E+4 ✓
+//   hook 点前: loc_7755C6 push ebx; push edi → E-0x58 → arg_0=[esp+0x5C]
+//   hook 内 push ebx/edx/edi/ebp → E-0x68 → arg_0=[esp+0x6C]  ★最终偏移
+//   （旧版 [esp+0x34] 取到 var_2C=0xFFFFFFFF → 死循环；
+//    上一版 [esp+0x64] 取到 E-4 = push 0xFFFFFFFF → 非法指针崩溃）
 static DWORD g_hookRetAddr = 0x0077593E;
 
 void __declspec(naked) texts_hook() {
@@ -285,7 +293,7 @@ void __declspec(naked) texts_hook() {
         push edx
         push edi
         push ebp
-        mov  ecx, [esp+0x64]     ; arg0 = 原始 key (#UI_XXX)，非 esi!
+        mov  ecx, [esp+0x6C]     ; arg0 = 原始 key (#UI_XXX)，非 esi!
         push ecx
         call FindTextByKey
         add  esp, 4               ; 清理 cdecl 参数 - 必须! 否则栈不平衡加载即 runtime error
