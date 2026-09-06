@@ -160,7 +160,19 @@ static void LogWrite(const char* fmt, ...) {
     va_start(ap, fmt);
     vsprintf_s(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    HANDLE h = CreateFileA("update\\hook_debug.log", GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // 优先写 DLL 所在目录（update\），回退 CWD
+    char path[MAX_PATH] = {0};
+    HMODULE hm = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&LogWrite, &hm)) {
+        GetModuleFileNameA(hm, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        if (slash) { slash[1] = '\0'; lstrcatA(path, "hook_debug.log"); }
+        else { lstrcpyA(path, "update\\hook_debug.log"); }
+    } else {
+        lstrcpyA(path, "update\\hook_debug.log");
+    }
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
     SetFilePointer(h, 0, NULL, FILE_END);
     DWORD wr;
@@ -257,11 +269,21 @@ static void LoadDict(void) {
 
 static char* FindTextByKey(const char* key) {
     if (!key) { LogHookHit("(null)", NULL); return NULL; }
-    DWORD crc = CalcCRC32(key);
+    // hook 收到的 key 是混合大小写(如 #uiLowVideoMemWarning)，词典全是全大写
+    // CRC32 大小写敏感，必须先转大写再查
+    char upperKey[256];
+    int i;
+    for (i = 0; key[i] && i < 255; i++) {
+        char c = key[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        upperKey[i] = c;
+    }
+    upperKey[i] = '\0';
+    DWORD crc = CalcCRC32(upperKey);
     EnterCriticalSection(&g_cs);
     char* res = HashFind(crc);
     LeaveCriticalSection(&g_cs);
-    LogHookHit(key, res);
+    LogHookHit(key, res);  // 日志记原始 key 便于调试
     return res;
 }
 
