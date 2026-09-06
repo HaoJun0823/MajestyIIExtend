@@ -268,6 +268,15 @@ static char* FindTextByKey(const char* key) {
 // ============================================================
 // TextsHook - 文本构建循环拦截 (hook @ 0x775939)
 // ============================================================
+// 反汇编确认（sub_775510 = Localization::LocalizerText::LocalizeKey）：
+//   0x7758b7: mov edi,[esp+58h+arg_8]   ; edi = 输出 std::string (result)
+//   0x77591b~0x775935: 哈希计算取池化数据
+//   0x775935: mov esi,[ecx+edx+8]       ; esi = **本地化文本**（英文原文，不是 key!）
+//   0x775939: movzx eax,byte ptr [esi]  ; ← hook 点（循环逐字符追加到 result）
+//   0x775940: push eax; operator+=; ...  ; 逐字符复制循环
+// 因此 0x775939 处 esi 是查池后的英文文本，直接 push esi 查 #UI_XXX 词典必然 MISS。
+// 正确取参：arg0(原始key) 在 [prologue后esp+0x54] = [push ebp/edx/edi/ebp后 esp+0x64]
+//   （原版 texts() 取 [esp+0x24+16]=[esp+0x34]，指向 var_2C=0xFFFFFFFF 垃圾 → CRC32 死循环）
 static DWORD g_hookRetAddr = 0x0077593E;
 
 void __declspec(naked) texts_hook() {
@@ -276,12 +285,13 @@ void __declspec(naked) texts_hook() {
         push edx
         push edi
         push ebp
-        push esi              ; key = 循环正在复制的源字符串（esi 由游戏设为 arg_4）
+        mov  ecx, [esp+0x64]     ; arg0 = 原始 key (#UI_XXX)，非 esi!
+        push ecx
         call FindTextByKey
-        add  esp, 4           ; 清理 cdecl 参数 (push esi) - 必须! 否则栈不平衡加载即runtime error
+        add  esp, 4               ; 清理 cdecl 参数 - 必须! 否则栈不平衡加载即 runtime error
         test eax, eax
         jz   no_change
-        mov  esi, eax
+        mov  esi, eax             ; 命中 → 用译文替换 esi（循环将逐字节复制译文到 result）
     no_change:
         pop  ebp
         pop  edi
