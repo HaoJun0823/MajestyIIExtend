@@ -346,8 +346,11 @@ void __declspec(naked) texts_hook() {
 //   state=2: 组合 UTF-8 码点, 查 charlist, 返回 index+0x100-0x20
 //   (首字节 0xE0~0xEF + 0x20 = 0x100~0x10F, 必须存完整 DWORD)
 //
-// 解码: codepoint = ((b1-0x20)&0x0F)<<12 | ((b2-0x20)&0x3F)<<6 | ((b3-0x20)&0x3F)
-//   其中 b3 = arg1(当前字节+0x20); b1/b2 存的是 arg1 (字节+0x20)
+// 解码: codepoint = (b1&0x0F)<<12 | (b2&0x3F)<<6 | (b3&0x3F)
+//   b1/b2/b3 都是 arg1 值。对于非 ASCII(>=0x80)字节，游戏做
+//   (signed)byte+224=byte-32，wrapper 做 +0x20，抵消后 arg1=原始字节。
+//   所以 state 2 中不能 sub 0x20，直接 & mask 即可。
+//   (state 0 的 _leave 处 sub 0x20 是给 ASCII 用的，arg1=byte+0x20)
 
 __declspec(naked) void sub_700036A0()
 {
@@ -360,19 +363,21 @@ __declspec(naked) void sub_700036A0()
         cmp byte ptr [ecx],1
         je _caseState1         ; state=1 → 等第二字节
         ; ---- state=2: 第三字节组合 ----
-        ; b1 = [edx] (DWORD), b2 = [edx+4] (DWORD), b3 = eax
-        ; codepoint = ((b1-0x20)&0x0F)<<12 | ((b2-0x20)&0x3F)<<6 | ((b3-0x20)&0x3F)
+        ; b1/b2/b3 存的都是 arg1 的值
+        ; 对于非 ASCII 字节(>=0x80)：游戏先 (signed)byte+224=byte-32，
+        ;   wrapper 再 +0x20，两者抵消，arg1 = 原始字节值
+        ; 对于 ASCII 字节：游戏不做变换，wrapper +0x20，arg1 = byte+0x20
+        ; b1(lead 0xE0~0xEF)、b2/b3(continuation 0x80~0xBF) 都 >= 0x80，
+        ;   所以 arg1 = 原始字节值，不需要 sub 0x20
+        ; codepoint = (b1&0x0F)<<12 | (b2&0x3F)<<6 | (b3&0x3F)
         movzx ebx, byte ptr [edx]     ; b1 低字节
-        sub ebx, 0x20
         and ebx, 0x0F
         shl ebx, 12
         movzx ecx, byte ptr [edx+4]   ; b2 低字节
-        sub ecx, 0x20
         and ecx, 0x3F
         shl ecx, 6
         or  ebx, ecx
-        movzx ecx, al
-        sub ecx, 0x20
+        movzx ecx, al                  ; b3 = arg1 低字节
         and ecx, 0x3F
         or  ebx, ecx                  ; ebx = Unicode 码点
         ; 搜索 charlist
