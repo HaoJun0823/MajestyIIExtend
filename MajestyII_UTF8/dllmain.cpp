@@ -309,9 +309,11 @@ _caseState1:
         mov [edx+4], eax
         mov ecx,[esp+12]       ; 重新加载状态指针
         mov byte ptr [ecx],2
-        mov eax,0xDF           ; 与 lead byte 相同的 fallback（0xFF-0x20=0xDF）
-                                ; glyph_index=0xFF，宽度已在 0xA0D810 补零
-                                ; wrapper2 的 cmp eax,0xFF 不匹配 → 不触发死代码
+        xor eax,eax            ; 返回 0（字形索引 0，零宽）
+                                ; 对齐原版 _caseA9 行为：
+                                ;   lead 返回 0xFF(fallback 宽1.0) 后，第二字节必须零宽
+                                ;   （原版 GBK lead==0xDF 时第二字节 _caseA9 返回 0）
+                                ;  否则两个 fallback 宽字形叠加 → 超大横线
         pop ebx
         ret
 _caseState0:
