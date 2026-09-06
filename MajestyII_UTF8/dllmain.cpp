@@ -309,11 +309,8 @@ _caseState1:
         mov [edx+4], eax
         mov ecx,[esp+12]       ; 重新加载状态指针
         mov byte ptr [ecx],2
-        xor eax,eax            ; 返回 0（字形索引 0，零宽）
-                                ; 对齐原版 _caseA9 行为：
-                                ;   lead 返回 0xFF(fallback 宽1.0) 后，第二字节必须零宽
-                                ;   （原版 GBK lead==0xDF 时第二字节 _caseA9 返回 0）
-                                ;  否则两个 fallback 宽字形叠加 → 超大横线
+        mov eax,0xDF           ; fallback 字形 0xFF（0xFF-0x20=0xDF）
+                                ; 与 lead byte 相同。不能返回 0（渲染循环会把字符值0当终止符/死循环）
         pop ebx
         ret
 _caseState0:
