@@ -513,7 +513,8 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         for (int i = 0; i < HASH_SIZE; i++) g_hashTable[i].text = NULL;
         LoadDict();
         ApplyHooks();
-        //ApplyZeroWidthPatch();  // 原版无此补丁，零宽靠 PatchWord(0x7E1A2F, 0x9090) 实现
+        ApplyZeroWidthPatch();  // patch fallback 字形宽度为 0，消除 UTF-8 前缀字节的 fallback 宽字形（超大横线）
+                                // 不能改状态机返回 0（渲染循环把字符值0当终止符→卡死），只能让 fallback 字形零宽
         break;
     case DLL_PROCESS_DETACH:
         for (int i = 0; i < HASH_SIZE; i++) {
