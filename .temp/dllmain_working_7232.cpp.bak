@@ -222,7 +222,7 @@ void __declspec(naked) texts_hook() {
         mov  ecx, [esp+0x24 + 16]
         push ecx
         call FindTextByKey
-        add  esp, 4              ; 清理 cdecl 参数 (push ecx) - 必须! 否则栈不平衡加载即runtime error
+        add  esp, 4              ; 清理 cdecl 参数 (push ecx)
         test eax, eax
         jz   no_change
         mov  esi, eax
@@ -309,9 +309,8 @@ _caseState1:
         mov [edx+4], eax
         mov ecx,[esp+12]       ; 重新加载状态指针
         mov byte ptr [ecx],2
-        mov eax,0xDF           ; 与 lead byte 相同的 fallback（0xFF-0x20=0xDF）
-                                ; glyph_index=0xFF，宽度已在 0xA0D810 补零
-                                ; wrapper2 的 cmp eax,0xFF 不匹配 → 不触发死代码
+        mov eax,0xDF           ; fallback 字形 0xFF（0xFF-0x20=0xDF）
+                                ; 与 lead byte 相同。不能返回 0（渲染循环会把字符值0当终止符/死循环）
         pop ebx
         ret
 _caseState0:
@@ -483,12 +482,12 @@ void HookJmp(DWORD addr, DWORD func)
 
 static void ApplyHooks()
 {
+    PatchWord(0x7E1A2F, 0x9090);
+    HookJmp(0x775939, (DWORD)texts_hook);
     HookCall(0x7D95F7, (DWORD)sub_70003870);
     HookCall(0x7D9DAA, (DWORD)sub_70003870);
     HookCall(0x7E1A53, (DWORD)sub_70003810);
     HookCall(0x7E235D, (DWORD)sub_700037A0);
-    PatchWord(0x7E1A2F, 0x9090);
-    // HookJmp(0x775939, (DWORD)texts_hook);  // [实验] 暂时禁用 texts_hook 隔离死循环归属
 }
 
 // ============================================================
@@ -514,7 +513,8 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         for (int i = 0; i < HASH_SIZE; i++) g_hashTable[i].text = NULL;
         LoadDict();
         ApplyHooks();
-        ApplyZeroWidthPatch();
+        ApplyZeroWidthPatch();  // patch fallback 字形宽度为 0，消除 UTF-8 前缀字节的 fallback 宽字形（超大横线）
+                                // 不能改状态机返回 0（渲染循环把字符值0当终止符→卡死），只能让 fallback 字形零宽
         break;
     case DLL_PROCESS_DETACH:
         for (int i = 0; i < HASH_SIZE; i++) {
