@@ -36,7 +36,8 @@ BYTE g_state1[12] = {0,0,0,0, 0,0,0,0, 0,0,0,0};   // hook 1 主渲染
 BYTE g_state2[12] = {0,0,0,0, 0,0,0,0, 0,0,0,0};   // hook 2 宽度缓存
 BYTE g_state3[12] = {0,0,0,0, 0,0,0,0, 0,0,0,0};   // hook 3&4 渲染
 
-PWORD g_pCharlist = (PWORD)g_charlist_data;
+// g_charlist[] and g_charlist_count defined in charlist_data.h
+PWORD g_pCharlist = (PWORD)g_charlist;
 
 // ============================================================
 // 字典系统 (TextsHook)
