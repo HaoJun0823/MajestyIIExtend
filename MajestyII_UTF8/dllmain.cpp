@@ -222,6 +222,7 @@ void __declspec(naked) texts_hook() {
         mov  ecx, [esp+0x24 + 16]
         push ecx
         call FindTextByKey
+        add  esp, 4              ; 清理 cdecl 参数 (push ecx)
         test eax, eax
         jz   no_change
         mov  esi, eax
@@ -482,12 +483,12 @@ void HookJmp(DWORD addr, DWORD func)
 
 static void ApplyHooks()
 {
+    PatchWord(0x7E1A2F, 0x9090);
+    HookJmp(0x775939, (DWORD)texts_hook);
     HookCall(0x7D95F7, (DWORD)sub_70003870);
     HookCall(0x7D9DAA, (DWORD)sub_70003870);
     HookCall(0x7E1A53, (DWORD)sub_70003810);
     HookCall(0x7E235D, (DWORD)sub_700037A0);
-    PatchWord(0x7E1A2F, 0x9090);
-    HookJmp(0x775939, (DWORD)texts_hook);
 }
 
 // ============================================================
@@ -513,7 +514,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         for (int i = 0; i < HASH_SIZE; i++) g_hashTable[i].text = NULL;
         LoadDict();
         ApplyHooks();
-        ApplyZeroWidthPatch();
+        //ApplyZeroWidthPatch();  // 原版无此补丁，零宽靠 PatchWord(0x7E1A2F, 0x9090) 实现
         break;
     case DLL_PROCESS_DETACH:
         for (int i = 0; i < HASH_SIZE; i++) {
