@@ -1,28 +1,17 @@
-// MajestyIIExtend - 合并字库修复 + 文本替换的 DLL（UTF-8 版）
-// 基于 MJ2_fontfix (1078行) 和 MJ2_TextsHook_nolog (200行) 重构
+// MajestyIIExtend - 合并字库修复 + 文本替换的 DLL（GBK 版）
+// 基于 MJ2_fontfix 原版 GBK 2字节状态机 + MJ2_TextsHook 文本替换
 //
-// 核心改进（相对原版 GBK 方案）：
-// 1. 状态机改为 UTF-8 3字节解码：1110xxxx 10xxxxxx 10xxxxxx → Unicode 码点
-// 2. charlist 改为 Unicode 码点数组（顺序与原版 GBK 完全一致 → 字形索引不变）
-// 3. 字典支持 UTF-8（带/不带 BOM），同时兼容原 GBK 词典
-// 4. 零宽字形补丁：修补 fallback 字形宽度，消除 UTF-8 前缀字节产生的间隙
+// 核心策略：
+// 1. 使用原版 GBK 2字节状态机（已验证可靠，无去同步问题）
+// 2. 词典加载时将 UTF-8 译文转码为 GBK 编码（WideCharToMultiByte CP_ACP）
+// 3. charlist 使用原版 GBK 编码表（6996 条）
+// 4. 零宽字形补丁：修补 fallback 字形宽度
 //
-// 字库映射原理：
-//   UTF-8 中文 = 3 字节 (E0-EF)(80-BF)(80-BF)，解码为 Unicode 码点 U+4E00~U+9FFF
-//   状态机 3 个状态：等待 lead → 等待 byte2 → 等待 byte3 → 组合查表
-//   前两个字节返回 fallback（宽度清零），第三个字节返回实际字形索引
-//
-// 状态机与 wrapper 参数约定（对齐原版已编译 DLL 反汇编验证）：
-//   子函数 sub_700036A0:
-//     [esp+4]  = arg1 (字形索引 + 0x20)
-//     [esp+8]  = arg2 (状态指针)
-//     edx      = b1 存储指针
-//   返回 eax = 字形索引 - 0x20
-//
-//   原版: arg2 = &adderN, edx = &adderN+1 (flag 和 lead 相邻字节)
-//   本版: arg2 = &g_stateN[0] (flag), edx = &g_stateN[4] (b1, DWORD)
-//   状态布局: [0]=flag(BYTE), [4]=b1(DWORD), [8]=b2(DWORD)
-//   因为 UTF-8 首字节 0xE0~0xEF + 0x20 = 0x100~0x10F 溢出 8 位，必须存完整 DWORD
+// 为什么放弃 UTF-8 3字节状态机：
+//   游戏引擎有多个独立渲染遍次（主渲染、宽度缓存等），每个遍次独立遍历文本字节
+//   UTF-8 中文占 3 字节，不同遍次在字符中间交替导致状态机永远无法累积完整序列
+//   GBK 中文占 2 字节，每个 hook 点能独立完成解码，所以原版方案有效
+//   方案改为：词典输出 GBK 编码文本，状态机使用原版 GBK 2字节逻辑
 
 #include "pch.h"
 #include <windows.h>
@@ -31,12 +20,9 @@
 #include "charlist_data.h"
 
 // ============================================================
-// 全局状态（3 对，对应 4 个 hook 点）
+// GBK 状态变量（6 个 BYTE，对应 3 对 hook 点，与原版完全一致）
 // ============================================================
-// [0]=flag, [4]=b1, [8]=b2
-BYTE g_state1[12] = {0,0,0,0, 0,0,0,0, 0,0,0,0};   // hook 1 主渲染
-BYTE g_state2[12] = {0,0,0,0, 0,0,0,0, 0,0,0,0};   // hook 2 宽度缓存
-BYTE g_state3[12] = {0,0,0,0, 0,0,0,0, 0,0,0,0};   // hook 3&4 渲染
+BYTE adder1=0,adder2=0,adder3=0,adder4=0,adder5=0,adder6=0;
 
 // g_charlist[] and g_charlist_count defined in charlist_data.h
 PWORD g_pCharlist = (PWORD)g_charlist;
@@ -130,28 +116,29 @@ static int IsLikelyUTF8(const char* buf, DWORD sz) {
     return utf8_seq > other_seq;
 }
 
-// GBK → UTF-8 转换（HeapAlloc 返回，调用者释放）
-static char* GbkToUtf8(const char* gbk, int len) {
-    int wlen = MultiByteToWideChar(CP_ACP, 0, gbk, len, NULL, 0);
+// UTF-8 → GBK 转换（HeapAlloc 返回，调用者释放）
+// 词典文件是 UTF-8 编码，但游戏渲染管线需要 GBK 字节流
+static char* Utf8ToGbk(const char* utf8, int len) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, len, NULL, 0);
     if (wlen <= 0) return NULL;
     wchar_t* w = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, (wlen + 1) * sizeof(wchar_t));
     if (!w) return NULL;
-    MultiByteToWideChar(CP_ACP, 0, gbk, len, w, wlen);
+    MultiByteToWideChar(CP_UTF8, 0, utf8, len, w, wlen);
     w[wlen] = 0;
-    int ulen = WideCharToMultiByte(CP_UTF8, 0, w, wlen, NULL, 0, NULL, NULL);
-    char* out = (char*)HeapAlloc(GetProcessHeap(), 0, ulen + 1);
+    int glen = WideCharToMultiByte(CP_ACP, 0, w, wlen, NULL, 0, NULL, NULL);
+    char* out = (char*)HeapAlloc(GetProcessHeap(), 0, glen + 1);
     if (out) {
-        WideCharToMultiByte(CP_UTF8, 0, w, wlen, out, ulen, NULL, NULL);
-        out[ulen] = 0;
+        WideCharToMultiByte(CP_ACP, 0, w, wlen, out, glen, NULL, NULL);
+        out[glen] = 0;
     }
     HeapFree(GetProcessHeap(), 0, w);
     return out;
 }
 
 // ============================================================
-// 调试日志（诊断"还是英语"问题）
+// 调试日志
 // ============================================================
-static int g_dictLoaded = -1;   // -1=未加载 0=失败 1=成功
+static int g_dictLoaded = -1;
 static int g_dictCount = 0;
 
 static void LogWrite(const char* fmt, ...) {
@@ -160,7 +147,6 @@ static void LogWrite(const char* fmt, ...) {
     va_start(ap, fmt);
     vsprintf_s(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    // 优先写 DLL 所在目录（update\），回退 CWD
     char path[MAX_PATH] = {0};
     HMODULE hm = NULL;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -180,7 +166,6 @@ static void LogWrite(const char* fmt, ...) {
     CloseHandle(h);
 }
 
-// 记录 hook 命中情况（限制日志量避免刷爆）
 static void LogHookHit(const char* key, const char* res) {
     static int count = 0;
     if (count++ < 200) {
@@ -194,7 +179,6 @@ static void LogHookHit(const char* key, const char* res) {
 }
 
 static void LoadDict(void) {
-    // 优先从 DLL 所在目录加载词典（ASI 部署在 update\ 下，游戏 CWD 可能不是该目录）
     char dllDir[MAX_PATH] = {0};
     HMODULE hm = NULL;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -229,10 +213,16 @@ static void LoadDict(void) {
     char* src = buf;
     char* toFree = NULL;
     if (!is_utf8) {
-        toFree = GbkToUtf8(buf, (int)sz);
-        if (toFree) src = toFree;
+        // 词典已经是 GBK 编码，直接使用
+        // 但仍需检查是否有 BOM
+    } else {
+        // UTF-8 词典：值（译文）需要转为 GBK 编码
+        // 跳过 BOM
+        if ((BYTE)src[0] == 0xEF && (BYTE)src[1] == 0xBB && (BYTE)src[2] == 0xBF)
+            src += 3;
     }
-    if ((BYTE)src[0] == 0xEF && (BYTE)src[1] == 0xBB && (BYTE)src[2] == 0xBF)
+    // 注意：is_utf8=0 时也检查 BOM（GBK 不会有 BOM，但以防万一）
+    if (!is_utf8 && (BYTE)src[0] == 0xEF && (BYTE)src[1] == 0xBB && (BYTE)src[2] == 0xBF)
         src += 3;
 
     char* p = src;
@@ -253,15 +243,24 @@ static void LoadDict(void) {
         if (key[0] == '\0' || val[0] == '\0') continue;
 
         DWORD crc = CalcCRC32(key);
-        int vlen = (int)strlen(val);
+
+        // 如果词典是 UTF-8，将译文从 UTF-8 转为 GBK
+        char* finalVal = val;
+        char* gbkVal = NULL;
+        if (is_utf8) {
+            gbkVal = Utf8ToGbk(val, (int)strlen(val));
+            if (gbkVal) finalVal = gbkVal;
+        }
+
+        int vlen = (int)strlen(finalVal);
         char* copy = (char*)HeapAlloc(GetProcessHeap(), 0, vlen + 1);
         if (copy) {
-            memcpy(copy, val, vlen + 1);
+            memcpy(copy, finalVal, vlen + 1);
             HashInsert(crc, copy);
             g_dictCount++;
         }
+        if (gbkVal) HeapFree(GetProcessHeap(), 0, gbkVal);
     }
-    if (toFree) HeapFree(GetProcessHeap(), 0, toFree);
     HeapFree(GetProcessHeap(), 0, buf);
     g_dictLoaded = 1;
     LogWrite("LoadDict: OK count=%d is_utf8=%d\n", g_dictCount, is_utf8);
@@ -269,8 +268,6 @@ static void LoadDict(void) {
 
 static char* FindTextByKey(const char* key) {
     if (!key) { LogHookHit("(null)", NULL); return NULL; }
-    // hook 收到的 key 是混合大小写(如 #uiLowVideoMemWarning)，词典全是全大写
-    // CRC32 大小写敏感，必须先转大写再查
     char upperKey[256];
     int i;
     for (i = 0; key[i] && i < 255; i++) {
@@ -283,30 +280,13 @@ static char* FindTextByKey(const char* key) {
     EnterCriticalSection(&g_cs);
     char* res = HashFind(crc);
     LeaveCriticalSection(&g_cs);
-    LogHookHit(key, res);  // 日志记原始 key 便于调试
+    LogHookHit(key, res);
     return res;
 }
 
 // ============================================================
 // TextsHook - 文本构建循环拦截 (hook @ 0x775939)
 // ============================================================
-// 反汇编确认（sub_775510 = Localization::LocalizerText::LocalizeKey）：
-//   0x7758b7: mov edi,[esp+58h+arg_8]   ; edi = 输出 std::string (result)
-//   0x77591b~0x775935: 哈希计算取池化数据
-//   0x775935: mov esi,[ecx+edx+8]       ; esi = **本地化文本**（英文原文，不是 key!）
-//   0x775939: movzx eax,byte ptr [esi]  ; ← hook 点（循环逐字符追加到 result）
-//   0x775940: push eax; operator+=; ...  ; 逐字符复制循环
-// 因此 0x775939 处 esi 是查池后的英文文本，直接 push esi 查 #UI_XXX 词典必然 MISS。
-//
-// 栈偏移计算（arg_0 = 原始 key）：
-//   入口 esp=E（[E]=返回地址）；arg_0=[E+4]
-//   prologue: push 0xFFFFFFFF / push SEH / push eax → E-0xC
-//             sub esp,0x3C → E-0x48；push ebp → E-0x4C；push esi → E-0x50 (=帧基F)
-//   IDA: arg_0 = F+0x54 = E+4 ✓
-//   hook 点前: loc_7755C6 push ebx; push edi → E-0x58 → arg_0=[esp+0x5C]
-//   hook 内 push ebx/edx/edi/ebp → E-0x68 → arg_0=[esp+0x6C]  ★最终偏移
-//   （旧版 [esp+0x34] 取到 var_2C=0xFFFFFFFF → 死循环；
-//    上一版 [esp+0x64] 取到 E-4 = push 0xFFFFFFFF → 非法指针崩溃）
 static DWORD g_hookRetAddr = 0x0077593E;
 
 void __declspec(naked) texts_hook() {
@@ -315,13 +295,13 @@ void __declspec(naked) texts_hook() {
         push edx
         push edi
         push ebp
-        mov  ecx, [esp+0x6C]     ; arg0 = 原始 key (#UI_XXX)，非 esi!
+        mov  ecx, [esp+0x6C]
         push ecx
         call FindTextByKey
-        add  esp, 4               ; 清理 cdecl 参数 - 必须! 否则栈不平衡加载即 runtime error
+        add  esp, 4
         test eax, eax
         jz   no_change
-        mov  esi, eax             ; 命中 → 用译文替换 esi（循环将逐字节复制译文到 result）
+        mov  esi, eax
     no_change:
         pop  ebp
         pop  edi
@@ -334,23 +314,15 @@ void __declspec(naked) texts_hook() {
 }
 
 // ============================================================
-// FontFix - UTF-8 三字节解码状态机
+// FontFix - 原版 GBK 2字节状态机
 // ============================================================
-// sub_700036A0 (naked)
-// 参数: [esp+4]=arg1(字节+0x20), [esp+8]=arg2(状态指针), edx=b1指针
+// sub_700036A0 (naked) - 与原版 MJ2_fontfix.cpp 完全一致
+// 参数: [esp+4]=arg1(字节+0x20), [esp+8]=arg2(状态指针), edx=adder指针
 // 返回: eax = 字形索引 - 0x20
 //
-// 状态布局: [flag(BYTE)][b1(DWORD)][b2(DWORD)]
-//   state=0: 字节<=0xA0 → ASCII 返回字节; 字节>0xA0 → 存 b1, state=1, 返回 0xDF
-//   state=1: 存 b2, state=2, 返回 0xDF
-//   state=2: 组合 UTF-8 码点, 查 charlist, 返回 index+0x100-0x20
-//   (首字节 0xE0~0xEF + 0x20 = 0x100~0x10F, 必须存完整 DWORD)
-//
-// 解码: codepoint = (b1&0x0F)<<12 | (b2&0x3F)<<6 | (b3&0x3F)
-//   b1/b2/b3 都是 arg1 值。对于非 ASCII(>=0x80)字节，游戏做
-//   (signed)byte+224=byte-32，wrapper 做 +0x20，抵消后 arg1=原始字节。
-//   所以 state 2 中不能 sub 0x20，直接 & mask 即可。
-//   (state 0 的 _leave 处 sub 0x20 是给 ASCII 用的，arg1=byte+0x20)
+// GBK 状态机：
+//   state=0 (flag=0): 字节<=0xA0 → ASCII; 字节>0xA0 → 存 lead, state=1, 返回 0xFF-0x20
+//   state=1 (flag=1): 取 lead from [edx], 组合 (lead<<8)|trail, 查 charlist
 
 __declspec(naked) void sub_700036A0()
 {
@@ -359,35 +331,26 @@ __declspec(naked) void sub_700036A0()
         mov eax,[esp+4]        ; arg1 = 字节+0x20
         cmp byte ptr [ecx],0
         push ebx
-        je _caseState0         ; state=0
-        cmp byte ptr [ecx],1
-        je _caseState1         ; state=1 → 等第二字节
-        ; ---- state=2: 第三字节组合 ----
-        ; b1/b2/b3 存的都是 arg1 的值
-        ; 对于非 ASCII 字节(>=0x80)：游戏先 (signed)byte+224=byte-32，
-        ;   wrapper 再 +0x20，两者抵消，arg1 = 原始字节值
-        ; 对于 ASCII 字节：游戏不做变换，wrapper +0x20，arg1 = byte+0x20
-        ; b1(lead 0xE0~0xEF)、b2/b3(continuation 0x80~0xBF) 都 >= 0x80，
-        ;   所以 arg1 = 原始字节值，不需要 sub 0x20
-        ; codepoint = (b1&0x0F)<<12 | (b2&0x3F)<<6 | (b3&0x3F)
-        movzx ebx, byte ptr [edx]     ; b1 低字节
-        and ebx, 0x0F
-        shl ebx, 12
-        movzx ecx, byte ptr [edx+4]   ; b2 低字节
-        and ecx, 0x3F
-        shl ecx, 6
-        or  ebx, ecx
-        movzx ecx, al                  ; b3 = arg1 低字节
-        and ecx, 0x3F
-        or  ebx, ecx                  ; ebx = Unicode 码点
-        ; 搜索 charlist
-        mov ecx,g_pCharlist
+        je _caseB7            ; state=0
+        ; ---- state=1: 第二字节，组合 GBK 码 ----
+        mov cl,[edx]           ; lead byte (存在 adder 里)
+        cmp cl,0xFF
+        je _caseA9            ; 无效 lead
+        movzx edx,al           ; trail byte (arg1)
+        shl edx,8
+        mov dl,cl             ; edx = (trail << 8) | lead → 注意字节序！
+        ; 原版逻辑: 组合 (al<<8 | cl) 作为 GBK combo 查表
+        ; al = arg1 = 第二字节+0x20-0x20 = 原始第二字节 (因为游戏对>0xA0的byte做signed+224=-32, wrapper +0x20, 抵消)
+        ; cl = [edx] = 第一字节 (存在 adder 里)
+        ; 查表: g_charlist[i] == (second<<8 | first) → 注意这里原版就是 first在低字节, second在高字节
+        mov [esp+8],edx        ; 写回组合码到栈
         xor eax,eax
+        mov ebx,g_pCharlist
 _search:
-        cmp bx, word ptr [ecx+eax]
+        cmp dx,[ebx+eax]
         je _found
         add eax,2
-        cmp word ptr [ecx+eax],0
+        cmp word ptr [ebx+eax],0
         je _notFound
         jmp _search
 _found:
@@ -400,27 +363,23 @@ _found:
         ret
 _notFound:
         mov edx,[esp+12]
-        mov eax,0x100          ; 未找到 → 0x100 (第一个中文字形)
+        mov eax,0x100
         mov byte ptr [edx],0
         sub eax,0x20
         pop ebx
         ret
-_caseState1:
-        ; 第二字节: 存 b2 = arg1, state=2
-        mov [edx+4], eax
-        mov ecx,[esp+12]       ; 重新加载状态指针
-        mov byte ptr [ecx],2
-        mov eax,0xDF           ; 与 lead byte 相同的 fallback（0xFF-0x20=0xDF）
-                                ; glyph_index=0xFF，宽度已在 0xA0D810 补零
-                                ; wrapper2 的 cmp eax,0xFF 不匹配 → 不触发死代码
+_caseA9:
+        ; lead byte 是 0xFF → 返回 0（不渲染）
+        xor eax,eax
         pop ebx
         ret
-_caseState0:
+_caseB7:
+        ; ---- state=0: 第一字节 ----
         cmp eax,0xA0
-        jbe _leave             ; 字节 <= 0x80 → ASCII
+        jbe _leave             ; ASCII (<=0x80 after +0x20, 即原始字节<=0xA0)
         mov byte ptr [ecx],1   ; state=1
-        mov [edx],eax          ; 存 b1 = arg1 (完整 DWORD)
-        mov eax,0xFF           ; 返回 0xFF，然后跳 _leave 减 0x20 = 0xDF
+        mov [edx],al            ; 存 lead byte 到 adder
+        mov eax,0xFF            ; 返回 0xFF
 _leave:
         sub eax,0x20
         pop ebx
@@ -429,7 +388,7 @@ _leave:
 }
 
 // ============================================================
-// FontFix - 4 个 Hook Wrapper 函数
+// FontFix - 4 个 Hook Wrapper 函数（与原版完全一致）
 // ============================================================
 // pushad 布局:
 //   [esp+0x00] = edi    [esp+0x10] = ebx
@@ -445,9 +404,9 @@ __declspec(naked) void sub_70003770()
         mov esi,[esp+8]
         mov eax,[esi]
         add eax,0x20
-        push offset g_state1
+        push offset adder1
         push eax
-        mov edx, offset g_state1+4   ; b1 指针
+        mov edx, offset adder2
         call sub_700036A0
         mov [esi],eax
         shl eax,5
@@ -477,14 +436,13 @@ __declspec(naked) void sub_700037B0()
         mov esi,[esp+8]
         mov eax,[esi+0x14]
         add eax,0x20
-        push offset g_state2
+        push offset adder3
         push eax
-        mov edx, offset g_state2+4
+        mov edx, offset adder4
         call sub_700036A0
         add esp,8
         cmp eax,0xFF
         jne _skip
-        ; 原版此分支（死代码，与二进制验证一致）
         mov [esi+0x14],eax
         mov ecx,[esi+0x18]
         mov edx,[ecx+0x34]
@@ -517,9 +475,9 @@ __declspec(naked) void sub_70003820()
         mov esi,[esp+8]
         mov eax,[esi]
         add eax,0x20
-        push offset g_state3
+        push offset adder5
         push eax
-        mov edx, offset g_state3+4
+        mov edx, offset adder6
         call sub_700036A0
         mov [esi],eax
         shl eax,5
@@ -595,9 +553,6 @@ static void ApplyHooks()
 // ============================================================
 // 零宽字形补丁
 // ============================================================
-// fallback 字形 @ 0xA0D7F8 (32字节), 宽度 = [0x18]-[0]
-// 0xA0D7F8+0x18 = 0xA0D810: 1.0f → 0.0f，UTF-8 前缀字节零宽
-
 static void ApplyZeroWidthPatch()
 {
     PatchDword(0xA0D810, 0x00000000);
