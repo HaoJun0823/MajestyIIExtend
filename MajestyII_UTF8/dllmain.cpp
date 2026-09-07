@@ -599,6 +599,129 @@ static void ApplyZeroWidthPatch()
 }
 
 // ============================================================
+// ZipFile Hook - 将 .pak 路径重定向到同名 .zip（如果存在）
+// ============================================================
+// 王权2 的 .pak 实际是 ZIP 格式打包，自定义字体贴图通过 .zip 覆盖
+// Hook 点: 0x007311B1 (eFileStream 构造+Open 调用点)
+// 原始函数: 0x00731410
+// IAT: g_CtorIAT=0x0087D2F8 (eFileStream构造), g_OpenIAT=0x0087D2F4 (eFileStream::Open)
+
+#define ZIP_CALL_ORIG_INSTR_ADDR  0x007311B1
+#define ZIP_ORIG_FUNC_ADDR        0x00731410
+
+DWORD g_CtorIAT = 0x0087D2F8;   // eFileStream::eFileStream 构造函数指针
+DWORD g_OpenIAT  = 0x0087D2F4;   // eFileStream::Open 函数指针
+
+static void* pOrigZipFunc = (void*)ZIP_ORIG_FUNC_ADDR;
+
+// 检查路径扩展名，若为 .pak 且对应的 .zip 文件存在，则返回 .zip 路径
+const char* CheckAndReplaceExt(const char* path)
+{
+    static char zipPath[MAX_PATH];
+    int len = 0;
+
+    while (path[len] != '\0' && len < MAX_PATH - 1) {
+        zipPath[len] = path[len];
+        len++;
+    }
+    zipPath[len] = '\0';
+
+    if (len <= 4 || len >= MAX_PATH - 4) {
+        return path;
+    }
+
+    if (zipPath[len - 4] != '.' ||
+        (zipPath[len - 3] != 'p' && zipPath[len - 3] != 'P') ||
+        (zipPath[len - 2] != 'a' && zipPath[len - 2] != 'A') ||
+        (zipPath[len - 1] != 'k' && zipPath[len - 1] != 'K'))
+    {
+        return path;
+    }
+
+    zipPath[len - 4] = '.';
+    zipPath[len - 3] = 'z';
+    zipPath[len - 2] = 'i';
+    zipPath[len - 1] = 'p';
+
+    if (GetFileAttributesA(zipPath) == INVALID_FILE_ATTRIBUTES)
+        return path;
+
+    return zipPath;
+}
+
+__declspec(naked) void ZipHookEntry()
+{
+    __asm {
+        push ebp
+        mov  ebp, esp
+        push ebx
+        push esi
+        push edi
+
+        mov  edi, ecx               // 保存流对象 this
+
+        // 取原路径并检查是否替换
+        mov  eax, [ebp+8]           // eName 对象指针
+        mov  eax, [eax+4]           // 原路径指针
+        push eax
+        call CheckAndReplaceExt
+        mov  ebx, eax               // ebx = 新路径（可能与原路径相同）
+
+        mov  eax, [ebp+8]
+        mov  eax, [eax+4]           // 重新获取原路径指针
+        cmp  ebx, eax
+        jne  use_custom
+
+        // 路径相同 → 跳转原始函数
+        mov  ecx, edi
+        pop  edi
+        pop  esi
+        pop  ebx
+        mov  esp, ebp
+        pop  ebp
+        jmp  dword ptr [pOrigZipFunc]
+
+    use_custom:
+        // 1. 调用基类构造函数 (IAT 间接)
+        mov  ecx, edi               // this
+        mov  eax, g_CtorIAT         // IAT 条目地址
+        call dword ptr [eax]        // 调用 eFileStream::eFileStream
+
+        // 2. 修改 eName 对象中的路径指针为 zip 路径
+        mov  eax, [ebp+8]           // eName 对象指针
+        mov  [eax+4], ebx           // 替换路径指针
+
+        // 3. 调用 Open(this, eName, flags, bufsize) (IAT 间接)
+        push dword ptr [ebp+14h]    // a5 (bufsize)
+        push dword ptr [ebp+10h]    // a4 (flags)
+        push eax                    // eName 对象
+        mov  ecx, edi               // this
+        mov  eax, g_OpenIAT         // IAT 条目地址
+        call dword ptr [eax]        // 调用 eFileStream::Open
+
+        // 4. 返回流对象 this
+        mov  eax, edi
+
+        pop  edi
+        pop  esi
+        pop  ebx
+        mov  esp, ebp
+        pop  ebp
+        ret  10h
+    }
+}
+
+void InstallHook_ZipFile()
+{
+    DWORD oldProt;
+    VirtualProtect((LPVOID)ZIP_CALL_ORIG_INSTR_ADDR, 5, PAGE_EXECUTE_READWRITE, &oldProt);
+    DWORD rel = (DWORD)ZipHookEntry - (ZIP_CALL_ORIG_INSTR_ADDR + 5);
+    *(BYTE*)ZIP_CALL_ORIG_INSTR_ADDR = 0xE9;
+    *(DWORD*)((BYTE*)ZIP_CALL_ORIG_INSTR_ADDR + 1) = rel;
+    VirtualProtect((LPVOID)ZIP_CALL_ORIG_INSTR_ADDR, 5, oldProt, &oldProt);
+}
+
+// ============================================================
 // DLL 入口
 // ============================================================
 BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
@@ -611,6 +734,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         LoadDict();
         ApplyHooks();
         ApplyZeroWidthPatch();
+        InstallHook_ZipFile();
         break;
     case DLL_PROCESS_DETACH:
         for (int i = 0; i < HASH_SIZE; i++) {
