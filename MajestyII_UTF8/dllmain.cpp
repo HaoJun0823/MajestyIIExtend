@@ -1273,6 +1273,10 @@ static void LoadDict(void) {
         Trim(val);
         if (key[0] == '\0' || val[0] == '\0') continue;
 
+        // 词典key统一转大写，与FindTextByKey的查询逻辑一致
+        for (int k = 0; key[k]; k++) {
+            if (key[k] >= 'a' && key[k] <= 'z') key[k] -= 32;
+        }
         DWORD crc = CRC32(key);
         int vlen = StrLen(val);
         char* copy = (char*)HeapAlloc(GetProcessHeap(), 0, vlen + 1);
@@ -1286,7 +1290,17 @@ static void LoadDict(void) {
 
 static char* __stdcall FindTextByKey(const char* key) {
     if (!key) return NULL;
-    DWORD crc = CRC32(key);
+    // 游戏传入混合大小写key(如#uiLowVideoMemWarning)，词典全大写
+    // CRC32大小写敏感，必须先转大写再查
+    char upperKey[256];
+    int i;
+    for (i = 0; key[i] && i < 255; i++) {
+        char c = key[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        upperKey[i] = c;
+    }
+    upperKey[i] = '\0';
+    DWORD crc = CRC32(upperKey);
     EnterCriticalSection(&g_cs);
     char* res = HashFind(crc);
     LeaveCriticalSection(&g_cs);
