@@ -334,6 +334,46 @@ void __declspec(naked) texts_hook() {
 }
 
 // ============================================================
+// 诊断日志: 记录字体状态机实际收到的 arg1 值
+// ============================================================
+// 目的: 确认游戏传给字体函数的是什么编码的字节
+// 记录前 N 次调用的 arg1 值(state/arg1 序列), 仅 hook1(主渲染)
+static int g_fontLogCount = 0;
+#define FONT_LOG_MAX 600
+
+static void LogFontArg(int state, DWORD arg1)
+{
+    if (g_fontLogCount >= FONT_LOG_MAX) return;
+    g_fontLogCount++;
+
+    char buf[128];
+    // 记录: state, arg1(hex), arg1-0x20(hex, 即原始值), arg1-0x20(dec)
+    DWORD raw = (arg1 >= 0x20) ? (arg1 - 0x20) : 0;
+    sprintf_s(buf, sizeof(buf), "FONT state=%d arg1=0x%04X raw=0x%02X(%u) ",
+              state, arg1, raw, raw);
+
+    // 追加到同一行 (state>0 时不换行, state=0 时新行)
+    if (state == 0) {
+        LogWrite("\n");  // 新字符开始
+    }
+    // 追加到日志 (不换行)
+    char path[MAX_PATH] = {0};
+    HMODULE hm = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&LogFontArg, &hm)) {
+        GetModuleFileNameA(hm, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        if (slash) { slash[1] = '\0'; lstrcatA(path, "font_debug.log"); }
+    }
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    DWORD wr;
+    WriteFile(h, buf, (DWORD)strlen(buf), &wr, NULL);
+    CloseHandle(h);
+}
+
+// ============================================================
 // FontFix - UTF-8 三字节解码状态机
 // ============================================================
 // sub_700036A0 (naked)
@@ -432,7 +472,7 @@ _leave:
 //   [esp+0x08] = ebp    [esp+0x18] = ecx
 //   [esp+0x0C] = orig   [esp+0x1C] = eax
 
-// Hook 1: 主渲染 (0x7E235D)
+// Hook 1: 主渲染 (0x7E235D) [诊断版: 带 arg1 日志]
 __declspec(naked) void sub_70003770()
 {
     __asm {
@@ -440,6 +480,20 @@ __declspec(naked) void sub_70003770()
         mov esi,[esp+8]
         mov eax,[esi]
         add eax,0x20
+        // --- 诊断: 记录 arg1 和 state ---
+        push ecx
+        push edx
+        mov ecx, offset g_state1
+        movzx ecx, byte ptr [ecx]   // state
+        push eax                     // 保存 arg1
+        push ecx                     // state
+        push eax                     // arg1
+        call LogFontArg
+        add esp, 8
+        pop eax                      // 恢复 arg1
+        pop edx
+        pop ecx
+        // --- 诊断结束 ---
         push offset g_state1
         push eax
         mov edx, offset g_state1+4   ; b1 指针
