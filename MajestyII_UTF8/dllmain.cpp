@@ -713,10 +713,12 @@ __declspec(naked) void ZipHookEntry()
 
 void InstallHook_ZipFile()
 {
+    // 原始指令是 E8 (CALL)，只改偏移量不改操作码
+    // ZipHookEntry 用 ret 10h 返回，依赖 CALL 压入的返回地址
     DWORD oldProt;
     VirtualProtect((LPVOID)ZIP_CALL_ORIG_INSTR_ADDR, 5, PAGE_EXECUTE_READWRITE, &oldProt);
+    *(BYTE*)ZIP_CALL_ORIG_INSTR_ADDR = 0xE8;  // 保持 CALL（不是 JMP!）
     DWORD rel = (DWORD)ZipHookEntry - (ZIP_CALL_ORIG_INSTR_ADDR + 5);
-    *(BYTE*)ZIP_CALL_ORIG_INSTR_ADDR = 0xE9;
     *(DWORD*)((BYTE*)ZIP_CALL_ORIG_INSTR_ADDR + 1) = rel;
     VirtualProtect((LPVOID)ZIP_CALL_ORIG_INSTR_ADDR, 5, oldProt, &oldProt);
 }
