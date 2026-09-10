@@ -1,282 +1,433 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: '2034ab36-2293-4c82-b1f0-f1152f37e2dc'
-  PropagateID: '2034ab36-2293-4c82-b1f0-f1152f37e2dc'
-  ReservedCode1: '36de0091-c818-4438-b944-64ef811ddacb'
-  ReservedCode2: '36de0091-c818-4438-b944-64ef811ddacb'
----
+# Majesty 2 汉化工程技术交接文档（GBK 双字节版）
 
-# Majesty 2 汉化工程交接文档（UTF-8 版）
-
-> 更新日期：2026-09-07
+> 更新日期：2026-09-10
 > 工程目录：`G:\Projects\MajestyIIExtend`
-> 游戏目录：`I:\SteamLibrary\steamapps\common\Majesty 2 Collection\`
+> 游戏目录：`I:\SteamLibrary\steamapps\common\Majesty 2 Collection`
+> 本文档描述**当前线上方案**（GBK/GB18030 双字节），已实机验证。
 
 ---
 
-## 一、项目总览
+## 0. 一句话总览
 
-Majesty 2（王权2）汉化 DLL，合并 MJ2_fontfix + MJ2_TextsHook 为单一 DLL。
-**当前版本从 GBK 双字节方案重构为 UTF-8 三字节方案**，已编译验证通过。
+游戏（32 位 x86，基址 `0x400000`）通过一个 ASI（DLL）插件接管两件事：
 
-### 时间线
+1. **字形映射**：把引擎按字节遍历的 GBK 双字节流，正确映射到我们自己烘的
+   CJK 贴图槽位（`slot = 在字表里的下标 + 224`）。
+2. **文本替换**：在引擎构建文本的循环里拦截每个词条 KEY，用 CRC32 查表换成中文。
 
-| 日期 | 里程碑 |
-|------|--------|
-| 2026-08-31 | 俄译中完成：M2_mod.loctable.xml col5 写入 2260 行译文 |
-| 2026-09-03 | 词典校对：V0/V1/Eng 三方比对，7264 条 KEY 一致 |
-| 2026-09-06 | 8 个过场视频简体/繁体中文字幕完成并部署 |
-| 2026-09-06 | MajestyIIExtend DLL 工程创建（GBK 合并版） |
-| 2026-09-07 | **UTF-8 重构完成，编译验证通过** |
+字库（19 套 DDS+TUV）与字表（`g_charlist_data[]`，23940 项）**顺序必须严格一致**，
+这是整个工程的第一铁律。
 
 ---
 
-## 二、UTF-8 方案核心设计
+## 1. ⚠️ 已被推翻的旧结论（务必不要重犯）
 
-### 2.1 与原版 GBK 方案的区别
+| 旧文档说法 | 真实情况 |
+|-----------|---------|
+| 「已从 GBK 双字节重构为 **UTF-8 三字节**方案」 | **错的，已回退。** 当前就是 GBK 双字节。UTF-8 三字节方案已废弃。 |
+| charlist 6995 条（Unicode 码点） | 实际 **23940 项 GBK 小端字**（前 6995 = 原版序，后 16945 = 追加）。 |
+| DLL 25088 字节 | 实际 **131584 字节**（`MajestyII_GB18030_2000.asi`）。 |
+| charlist 存 Unicode 码点 | **错的。** 存的是「小端字」`L = 首字节 \| (次字节 << 8)`。 |
+| 部署名 `majesty2_UTF8.asi` | 游戏实际加载 **`MajestyII_GB18030_2000.asi`**。见 §6。 |
+| 字形索引范围 0x100~0x1B3B | 现在是 `0x100 ~ 0x100+23939 = 0x5D83`。 |
 
-| 项目 | 原版 GBK | 当前 UTF-8 |
-|------|----------|------------|
-| 编码 | GBK 双字节 (lead+cont) | UTF-8 三字节 (E0-EF)(80-BF)(80-BF) |
-| 状态机 | 2 状态 (flag=0/1) | 3 状态 (flag=0/1/2) |
-| charlist | GBK 组合值 `((tail+0x20)<<8)|(lead+0x20)` | Unicode 码点 |
-| 状态存储 | BYTE flag + BYTE lead = 2 字节 | BYTE flag + DWORD b1 + DWORD b2 = 12 字节 |
-| 词典编码 | GBK | UTF-8（自动检测，兼容 GBK 输入） |
-| lead byte 返回 | 0xDF (0xFF-0x20) | 0xDF（同） |
-| 第二字节返回 | 0xFF（原版，触发 wrapper2 fallback） | **0xDF**（统一零宽，不触发 wrapper2 fallback） |
+---
 
-### 2.2 为什么 _caseState1 返回 0xDF 而非 0xFF
+## 2. 核心数据模型：字表 `g_charlist_data[]`
 
-原版 GBK 方案中 `_caseState1` 返回 0xFF（未经 `sub 0x20`），这是有意设计：
-- wrapper2（宽度缓存路径）中 `cmp eax,0xFF` 匹配 → 走特殊 fallback 路径设置宽度缓存
-- 其他 wrapper 中 0xFF → `shl 0xFF,5 = 0x1FE0` → 访问字形表偏移 0x1FE0 处的字形
+### 2.1 顺序 = GB18030 字节序，**不是 Unicode 序**
 
-UTF-8 方案改为返回 0xDF：
-- 字形表基址 = 0xA0BC18
-- 索引 0xDF → 字形@0xA0D7F8，宽度@0xA0D810（**已通过零宽补丁设为 0.0f**）
-- 索引 0xFF → 字形@0xA0DBF8，宽度@0xA0DC10（**未补零，1.0f，会产生间隙**）
-- 返回 0xDF 使前两个 UTF-8 字节都使用已补零的零宽字形
-- wrapper2 中 `cmp eax,0xFF` 不匹配（0xDF≠0xFF）→ 不走 fallback → 正常 `shl 0xDF,5` → 同一零宽字形
+- 共 **23940 项**（`WORD`），前 6995 项 = **原版顺序，永不改动**；后 16945 项为追加。
+- 整体顺序 = **完整 GBK（即 GB18030 的双字节子集）按 lead/trail 字节序枚举**。
 
-### 2.3 状态机返回值汇总
+### 2.2 每项存「小端字」L
 
-| 状态 | 输入 | 返回值 | glyph_index | 字形地址 | 宽度地址 | 宽度 |
-|------|------|--------|-------------|----------|----------|------|
-| state=0 | ≤0xA0 (ASCII) | byte-0x20 | byte | 基址+byte*32 | — | 正常 |
-| state=0 | >0xA0 (lead) | 0xDF | 0xFF | 0xA0D7F8 | 0xA0D810 | **0.0f** |
-| state=1 | 任意 | 0xDF | 0xFF | 0xA0D7F8 | 0xA0D810 | **0.0f** |
-| state=2 | 任意 | index+0x100-0x20 | index+0x100 | 基址+(index+0x100)*32 | — | 正常 |
-| state=2 | 未找到 | 0xE0 | 0x100 | 基址+0x2000 | — | 正常 |
-
-### 2.4 UTF-8 解码逻辑
-
-```
-codepoint = ((b1-0x20)&0x0F)<<12 | ((b2-0x20)&0x3F)<<6 | ((b3-0x20)&0x3F)
+```c
+// C 字面量写法 = 次字节<<8 | 首字节  → 内存小端 = [首字节][次字节]
+L = 首字节 | (次字节 << 8)
 ```
 
-其中 b1/b2 存储的是 arg1（原始字节+0x20），b3 = 当前字节的 arg1。
+**例**：
+- `！` = GBK `A3 A1` → 数组存 `0xA1A3` → 内存字节 `A3 A1`。
+- `單` = GBK `86 CE` → 数组存 `0xCE86` → 内存字节 `86 CE`。
 
-验证示例：
-- "中" = U+4E2D → UTF-8: E4 B8 AD
-  - b1=E4+0x20=0x104, (0x104-0x20)&0x0F=0x04, 0x04<<12=0x4000
-  - b2=B8+0x20=0xD8, (0xD8-0x20)&0x3F=0x38, 0x38<<6=0x0E00
-  - b3=AD+0x20=0xCD, (0xCD-0x20)&0x3F=0x2D
-  - codepoint = 0x4000 | 0x0E00 | 0x2D = 0x4E2D ✓
+⚠️ **经典陷阱**：如果存成原码（大端）`0xA3A1`，引擎按 L 查不到 →
+回退到「找不到」分支 → 显示错字（不是方框，是**别的真字**）。
+
+### 2.3 引擎取字算法（`sub_700036A0`，DLL 内 RVA `0x1A20`）
+
+引擎原始逻辑（我们 hook 后重写并保持等价）：
+
+```
+若 flag != 0：
+    若 本字节 == 0xFF：清 flag，返回 0（丢弃悬挂状态）
+    否则：L = 前一字节 | (本字节 << 8)
+          i = 在 g_charlist_data[] 里按值线性查找 L 的下标
+          若找到：slot = i + 0x100  →  返回 slot - 0x20 = i + 224
+          若找不到：slot = 0x100    →  返回 0x100 - 0x20 = 224（回退到第一个 CJK 槽）
+          flag = 0
+否则（flag == 0）：
+    若 本字节 >= 0x80：flag = 1，记住本字节，返回 0xFF（零宽前置标记）
+    否则：返回 本字节 - 0x20          （ASCII/拉丁，槽 0~223，不查表）
+```
+
+**slot 公式**：`slot = 下标 i + 224`（`224 = 0x100 - 0x20`）。
+- 拉丁单字节：`slot = 字节 - 0x20`，取值 0~223，**不查表**。
+- CJK：`slot = i + 224`，取值 224 ~ 24163。
+
+⚠️ **阈值陷阱（2026-09-10 已修）**：`flag == 0` 分支判据必须是 **`0x80`**，不能是 `0xA0`。
+- 上游 `0x7D95A2` / `0x7E22F6` 用的是 `mov al,[edx+4]; test al,al; jle`（**有符号**），
+  即「原字节 ≥ `0x80` → 走 CJK 分支」。
+- 若这里用 `0xA0`，则 GBK lead `0x81..0xA0` 的字（`單`=86CE、`務`=84D5 等）
+  不进配对、被当单字节吞掉 → **整串从次字节开始错位** → `單人任務` 显示成 `躓稳巳蝿`。
+- 现象特征：**错字都是真实的汉字，数量与原文一致，不出现多字符** —— 就是错位配对。
+
+### 2.4 `pushad` 栈布局（写 naked asm 时必记）
+
+```
+[esi+0x00] = EDI
+[esi+0x04] = ESI
+[esi+0x08] = EBP
+[esi+0x0C] = ESP_orig
+[esi+0x10] = EBX
+[esi+0x14] = EDX
+[esi+0x18] = ECX
+[esi+0x1C] = EAX
+```
+（`esi` 指 `pushad` 之后、`push esp` 得到的那个指针。）
 
 ---
 
-## 三、Hook 点清单
+## 3. Hook 点清单（32 位 x86，主程序基址 `0x400000`）
 
-全部为 32 位 x86，游戏主程序基址 0x400000：
+### 3.1 字形映射（4 个 call hook + 1 个 NOP）
 
-### FontFix（字形映射）
-| 地址 | 类型 | wrapper | 状态变量 | 用途 |
-|------|------|---------|----------|------|
-| 0x7E235D | 5字节 call | sub_700037A0 → sub_70003770 | g_state1 | 主渲染路径 |
-| 0x7E1A53 | 5字节 call | sub_70003810 → sub_700037B0 | g_state2 | 宽度缓存路径 |
-| 0x7D95F7 | 5字节 call | sub_70003870 → sub_70003820 | g_state3 | 渲染路径2 |
-| 0x7D9DAA | 5字节 call | sub_70003870 → sub_70003820 | g_state3 | 渲染路径3 |
+| 地址 | 类型 | 替换目标 | 备注 |
+|------|------|---------|------|
+| `0x7D95F7` | 5 字节 `call` | `sub_70003870` | 渲染路径 |
+| `0x7D9DAA` | 5 字节 `call` | `sub_70003870_B` | **独立状态**（adder7/8），避免与上一行互踩 |
+| `0x7E1A53` | 5 字节 `call` | `sub_70003810` | 宽度缓存路径 |
+| `0x7E235D` | 5 字节 `call` | `sub_700037A0` | 主渲染路径 |
+| `0x7E1A2F` | 2 字节 → `90 90` | — | **NOP 掉 `jge short`**，禁用宽度缓存快路径 |
 
-### TextsHook（文本替换）
+`sub_700036A0` 是共用的状态机入口；各 wrapper 的唯一区别是**各自持有独立的状态变量**
+（`adder1..adder8` 之类），因为引擎会在同一帧里穿插调用不同路径。
+
+### 3.2 文本替换（1 个 jmp hook）
+
 | 地址 | 类型 | 作用 |
 |------|------|------|
-| 0x775939 | 5字节 jmp | 文本构建循环拦截，CRC32 查词典替换 |
-| 返回地址 | — | 0x77593E |
+| `0x775939` | 5 字节 `jmp` | 拦截 `texts()` 文本构建循环，返回地址 `0x77593E` |
 
-### 补丁
-| 地址 | 类型 | 原始值 | 新值 | 作用 |
-|------|------|--------|------|------|
-| 0x7E1A2F | 2字节 NOP | `jge short` (7x xx) | `90 90` | 禁用宽度缓存快路径 |
-| 0xA0D810 | 4字节 | `0x3F800000` (1.0f) | `0x00000000` (0.0f) | 零宽字形（索引 0xDF/0xFF 共用） |
+处理逻辑：读到词条 KEY → **CRC32** 查哈希表（开放寻址，表大小 `65521`，
+`CRITICAL_SECTION` 保护）→ 命中则用 DLL 内 `HeapAlloc` 出的永久块替换文本。
 
----
+### 3.3 补丁
 
-## 四、编译验证结果
+| 地址 | 原始 | 新值 | 作用 |
+|------|------|------|------|
+| `0x7E1A2F` | `jge short` | `90 90` | 禁用宽度缓存快路径（见上） |
 
-### 4.1 编译配置
-
-- 工具集：VS2017 v141（14.16.27023）
-- 平台：Win32（x86 32位）
-- 字符集：Unicode
-- 输出：DLL（25088 字节）
-- 基址：0x10000000（无 ASLR，有 .reloc）
-- 编译选项：`/utf-8`（处理源码中的中文注释）
-
-### 4.2 反汇编验证
-
-用 capstone 反汇编编译出的 DLL，验证关键函数：
-
-**状态机**（@0x10001600）：
-- `cmp byte ptr [ecx],0` / `cmp byte ptr [ecx],1` → 3 状态分支 ✓
-- `movzx ebx,byte ptr [edx]; sub ebx,0x20; and ebx,0xf; shl ebx,0xc` → UTF-8 首字节解码 ✓
-- `movzx ecx,byte ptr [edx+4]; sub ecx,0x20; and ecx,0x3f; shl ecx,6` → 第二字节解码 ✓
-- `movzx ecx,al; sub ecx,0x20; and ecx,0x3f; or ebx,ecx` → 第三字节解码 ✓
-- `mov ecx,dword ptr [0x10008018]` → g_pCharlist 指针 ✓
-- `_caseState1` 返回 0xDF ✓（修正后）
-- `_caseState0` lead byte 返回 0xFF→0xDF（经 sub 0x20） ✓
-
-**Hook 安装**（@0x10001780）：
-- 4 个 call hook → 0x7D95F7, 0x7D9DAA, 0x7E1A53, 0x7E235D ✓
-- 2 字节 NOP → 0x7E1A2F ✓
-- 5 字节 jmp → 0x775939 ✓
-
-**零宽补丁**（@0x10001914）：
-- `mov dword ptr [0xa0d810], 0` → 1.0f 改为 0.0f ✓
-
-**pushad wrappers**：
-- 3 个 pushad wrapper（@0x100016D0, 0x10001730, 0x10001770）✓
-- 每个调用对应的内层 wrapper ✓
-
-**g_state 变量地址**：
-- g_state3 = 0x10008390 (hook 3&4)
-- g_state2 = 0x1000839C (hook 2)
-- g_state1 = 0x100083A8 (hook 1)
-- 每组 12 字节：[0]=flag, [4]=b1(DWORD), [8]=b2(DWORD)
+> 注：旧文档里的「零宽补丁 `0xA0D810`：`1.0f → 0.0f`」是 **UTF-8 三字节方案**的遗留，
+> 当前 GBK 方案**不再使用这个补丁**（GBK 方案的零宽靠 `slot 223 = 0xFF` 的 TUV 处理，见 §4.3）。
 
 ---
 
-## 五、charlist 数据
+## 4. TUV 贴图坐标格式（决定「字怎么排」）
 
-- 文件：`charlist_data.h`（自动生成，885 行）
-- 内容：6995 个 Unicode 码点 + 0x0000 终止符
-- 字形索引范围：0x100 ~ 0x1B3B（数组位置 + 0x100）
-- 生成工具：`.temp/gen_charlist_unicode.py`
-- 转换链：原版 GBK 组合值 → GBK 双字节码 → GB18030 解码 → Unicode 码点
-- 顺序与原版完全一致 → 字形索引不变
+### 4.1 文件格式
+
+```
+TUVTXT
+TUVCOUNT 24164
+TUVBASE 4096 4096
+<slot0 的 x1> <y1> <x2> <y2>
+<slot1 的 ...>
+...
+```
+
+- 第 3 行后，**每行对应一个 slot，行号 = slot 号**（从 0 开始）。
+- 坐标整数，`x1,y1` 左上闭，`x2,y2` 右下开。原始游戏文件用 **Tab** 分隔。
+
+### 4.2 ★ 步进（advance）公式 —— 最容易踩的坑
+
+> **引擎每字符的横向步进 = 下一槽的 `x0` − 本槽的 `x0`。**
+> TUV 矩形本身的宽度**不影响绘制**（矩形决定「取哪块贴图」，不决定「占多宽」）。
+
+也就是说：
+
+- `slot0`（空格 `0x20`）的宽度 = `slot1.x0 − slot0.x0`。
+- 想把空格压窄，**必须把 `slot0.x0` 前移**，只收窄矩形（`x2=x1`）是**没用的**。
+
+### 4.3 slot 223（字符 `0xFF`）必须写 `0 0 0 0`
+
+引擎**每画一个中文字之前，会先画一次 `0xFF` 前置标记**。
+若 `slot 223` 有真实墨迹 → 每个汉字前面都会糊上一块 → 视觉上像重影/乱码。
+
+- 中文 TUV：`slot 223` **必须** 写成 `0 0 0 0`（零尺寸，配合上面「步进=差分」公式，
+  零尺寸也不影响宽度，安全）。
+- **纯拉丁字库**（`TUVCOUNT ≤ 224`）：`0xFF` 是**真实字符 `ÿ`**，**禁止留空**。
+- 修补工具：`fontgen/blank_slot223_tuv.py`。
+
+### 4.4 空格槽压缩（`space_advance`）
+
+**背景**：字典里每个汉字之间必须有 ASCII 空格（见 §5），所以界面每个字后面都跟一个空格。
+若空格用自然宽度（约 7~9 px），界面会变成 `学 习 治 理` 的大间距。
+
+**解法**（`font_fromscratch.yaml` 的 `defaults.space_advance: 2`）：
+把 `slot0.x0` 设为 `slot1.x0 − 2`，让空格只占 2 px。
+
+**双保险**（防止某个环节漏掉）：
+1. `build_font_atlas.py` 的 `build_from_scratch()` → `write_tuv_scratch()` 支持 `space_advance`。
+2. `repack_texts.py` 在**重打包 zip 时**对每个 `.tuv` 自动再跑一次 `compress_slot0()`（幂等）。
+
+> ⚠️ **历史事故**：2026-09-10 13:16 修好 zip 里的 slot0，13:18 又跑了一次**旧版**
+> `repack_texts.py`，把修复**覆盖回自然宽度**了。现在压缩逻辑已内建进脚本，
+> 不可能再被覆盖 —— 这就是「双保险」的由来。
 
 ---
 
-## 六、词典系统
+## 5. 词典：`DictRead.txt` 与断行机制
 
-- 词典文件：`DictRead.txt`（运行时由 DLL 读取）
-- 自动检测编码：UTF-8（BOM 或内容启发式）或 GBK
-- GBK 词典自动转换为 UTF-8 后加载
-- 格式：KEY 行 + VALUE 行交替
-- 哈希：CRC32，表大小 65521（开放寻址法）
-- 线程安全：CRITICAL_SECTION 保护
+### 5.1 格式
+
+```
+#KEY_ENTRY
+中文值
+#NEXT_KEY
+另一个值
+```
+
+- **KEY 行以 `#` 开头，VALUE 是紧接着的下一行**（两行一组）。
+- 编码：**GBK**（`DictRead.txt`）。⚠️ `DictRead_V7*.txt` 是 **UTF-8**，别搞混。
+  编码自动识别在 DLL 里做（BOM / 内容启发式）。
+- 行尾：CRLF 或 LF 都能读（`LoadDict()` 把 `\n` 和 `\r` 都当行尾）。
+
+### 5.2 ★★ 为什么每个汉字后面必须有空格（本轮最关键结论）
+
+> **引擎只在「空格」处断行。**
+
+- 若字典是 **compact**（汉字连排、无空格）→ 超长串**没有任何断点** →
+  换行/悬挂缩进算法失效 → **文字只渲染首次，后续消失**（看起来像「闪烁一下就不见了」）。
+- 修复：**每个汉字后面补 1 个 ASCII 空格**。老版 V2 / V2.6 字典本来就是这样。
+- 现象验证：用户实测「在文本中间随便加个空格就没事了」→ 直接指向此根因。
+
+同理，`<...>` 标签内**不要加空格**（会被当成断行点破坏标签）。
+
+### 5.3 相关工具
+
+| 工具 | 作用 |
+|------|------|
+| `fontgen/apply_respace.py` | 标签感知地补空格 |
+| `fontgen/space_rule2.py` | 验证空格规则 |
+| `fontgen/dict_space_stats.py` | 统计字典空格情况 |
+| `fontgen/fix_space_wrap.py` | **批量修**：补空格 → 压空格步进 → 重打包 zip（简繁通用，`--dict` 指定路径） |
+
+### 5.4 ❌ 已失败并回退的尝试（不要重试）
+
+曾在 `0x7D96E5` 处 `HookJmp`，想在 `0x7D95F7` 文本函数内 `add ecx,ebx` 处
+「把 CJK 步进翻倍」来模拟空格宽度 → **加的是真实宽度**，界面变成 `学 习 治 理`，已回退。
+**正解还是补空格 + `space_advance` 压窄空格槽。**
 
 ---
 
-## 七、文件清单
+## 6. 部署与语言切换
+
+### 6.1 游戏实际加载的文件（★ 与脚本不符，已确认）
+
+`update/` 目录下的真实文件名：
+
+| 文件 | 说明 |
+|------|------|
+| **`MajestyII_GB18030_2000.asi`** | **游戏真正加载的插件**（131584 B）。**不是** `MajestyII_UTF8.asi`。 |
+| `DictRead.txt` | 简体词典（GBK）。**文件名硬编码在 DLL 里**（`#define DICT_FILE`）。 |
+| `localization/texts/texts.zip` | **字库实际加载路径**（44 条目，前缀 `enGUIne/Fonts/`）。 |
+
+⚠️ `update/localization/texts/` 下的散装 `small_c.tuv` / `small_c.dds`（若存在）
+**只是工作副本，不是加载路径** —— 曾经误导过一次结论，建议删除或改名。
+
+### 6.2 简繁切换机制（`global.ini`）
+
+`update/global.ini`（约 43 字节）：
+
+```ini
+[FileLoader]
+OverloadFromFolder=update_cht
+```
+
+- 游戏支持**多文件夹语言覆盖**：`OverloadFromFolder` 指定一个覆盖目录。
+- 繁体方案：建 `update_cht/`，内含繁体 `DictRead.txt` + 繁体 ASI + 繁体 `texts.zip`。
+- **汉字字形本身简繁共用同一套 `texts.zip`**（charlist 已含 GB18030 全部）
+  → 简繁的区别只在**词典文本**。
+- 实测证据：`update_cht/MJ2_log.txt` 时间戳正常，`hit=1713 / miss=0` → 机制真实生效。
+
+### 6.3 简繁关系
+
+- 简体 = master 词典（`update/DictRead.txt` ↔ `DictRead_V7.txt`）。
+- 繁体 = 由简体经 **OpenCC** 派生（`DictRead_V7_CHT.txt`），**同样需要补空格**。
+- 两者都已补空格（2026-09-10）：
+  - 简：`DictRead_V7.txt` 1105734 B
+  - 繁：`DictRead_V7_CHT.txt` 1105905 B（补 122496 个空格，7258 条被改）
+
+---
+
+## 7. 构建链（★ 换字体后「直接 build 就能成功」）
+
+### 7.1 字库构建（Python，19 套一次搞定）
+
+```bash
+cd G:\Projects\MajestyIIExtend\fontgen
+python build_font_atlas.py font_fromscratch.yaml
+```
+
+- **实测耗时约 3m30s**，输出 19 套（16 个 `.tuv` + 19 个 `.dds` + 19 个 `.png`）。
+- 成功判据（脚本末行）：`✅ 处理完成：启用 19 套（跳过 0 套），成功 19 套。`
+- 输出目录：`fontgen/out_fromscratch/`
+- **换字体只需改 `font_fromscratch.yaml` 里的 `font_path`**，其余不用动。
+
+**自检**（脚本内置，正常必全过）：贴图 CJK 槽 `224+k` 的字符
+**必须 == `decode(g_charlist_data[k])`**（23940 项逐项校验）。
+
+### 7.2 全链顺序（改字表时）
+
+```
+fix_charlist_endian.py
+   └─ 生成/校正 charlist_data.h（23940 项小端字）
+        ↓
+build_font_atlas.py font_fromscratch.yaml
+   └─ 19 套 DDS/TUV（顺序 == charlist_data.h）
+        ↓
+cl.exe 编译 dllmain.cpp → MajestyII_UTF8.dll
+        ↓
+部署为 update/MajestyII_GB18030_2000.asi
+        ↓
+重打包 texts.zip（repack_texts.py，内置 slot0 压缩）
+```
+
+> 🔴 **源码改了必须重编重部署。** 曾出现 `MajestyII_UTF8.asi` 长期是**早于源码的旧构建**
+> （`.text` 逐字节相同，只差 `.rdata` 追加段）。
+
+### 7.3 编译（cl.exe，Release|Win32）
+
+- 工具链：**VS2017 Professional** MSVC `14.16.27023`（x86）+ Windows SDK `10.0.26100.0`。
+- 关键选项：`/nologo /LD /EHsc /Y- /utf-8 /O2`（`/utf-8` 必须有，源码注释是中文）。
+- MSVC 内联汇编**不接受 `jmp imm32`** → 用 `push <addr>; ret`。
+- ⚠️ **本机 PowerShell 工具不能调 cl.exe**（报「无法在管道中间运行文档」）
+  → 用 **Git Bash** 跑 `build_deploy.sh`，或用 cmd 跑 `build.bat`。
+- 生产物 `MajestyII_GB18030_2000.asi` ≈ 14 万字节（视源码而定，实测 143872 B）。
+
+**★ Git Bash 调用 cl.exe 的路径陷阱（已修）**：
+cl.exe 是原生 Windows 程序，**看不懂 `/c/...` 风格路径**。
+早期脚本用 `MSYS_NO_PATHCONV=1 "$CL" ... "/I$MSVC_INC"` 会报
+`fatal error C1083: 无法打开包括文件 "windows.h"`。
+正解：用 **`cygpath -w` 把路径转成 `C:\...`**，再放进 `INCLUDE` / `LIB` 环境变量
+（`;` 分隔）。见 `build_deploy.sh` 里的 `WIN()` 函数。
+
+**控制台中文乱码**：脚本里的中文提示在 GBK 控制台会显示成乱码，
+脚本开头加 `chcp.com 65001`（或 `chcp 65001`）切到 UTF-8 即可。
+
+---
+
+## 8. 目录结构（整理后）
 
 ```
 G:\Projects\MajestyIIExtend\
-├── .gitignore
-├── .gitattributes
+├── README.md                     # 项目导航（新）
+├── RESEARCH_HANDOFF.md           # 本文件（技术文档）
+├── build_deploy.sh               # ★ 一键编译 + 部署（Git Bash）
+├── build.bat                     # ★ 同上的 cmd 版
 ├── MajestyIIExtend.sln
-├── RESEARCH_HANDOFF.md                    # 本文件
 ├── MajestyII_UTF8\
-│   ├── MajestyII_UTF8.vcxproj             # VS2017 项目（v141, Win32, DLL, /utf-8）
-│   ├── MajestyII_UTF8.vcxproj.filters
-│   ├── MajestyII_UTF8.vcxproj.user
-│   ├── dllmain.cpp                        # UTF-8 版主代码（~524行）
-│   ├── charlist_data.h                    # Unicode charlist（6995条）
-│   ├── framework.h
-│   ├── pch.h
-│   ├── pch.cpp
-│   └── Release\
-│       └── MajestyII_UTF8.dll             # 编译输出（25088字节）
-├── .temp\
-│   ├── extract_charlist.py                # 原 GBK charlist 提取
-│   ├── gen_charlist_unicode.py            # Unicode charlist 生成
-│   ├── verify_dll.py                     # DLL 反汇编验证
-│   ├── verify_pushad.py                  # pushad wrapper 验证
-│   ├── verify_fix.py                     # 状态机修正验证
-│   ├── analyze_glyph_addr.py             # 字形表地址分析
-│   └── stat_translation_state.py         # 翻译状态统计
+│   ├── dllmain.cpp               # 主代码（GBK 双字节 + texts hook + zip hook）
+│   ├── charlist_data.h           # 字表（23940 项小端字，自动生成）
+│   ├── MajestyII_UTF8.vcxproj    # v141 / Win32 / DLL / /utf-8
+│   ├── framework.h / pch.h / pch.cpp
+│   └── _archive/bak/             # 旧 .bak 归档
+├── fontgen\
+│   ├── build_font_atlas.py       # ★ 字库生成器（追加 / from_scratch 双模式）
+│   ├── font_fromscratch.yaml     # ★ 当前生产配置（19 套字体）
+│   ├── repack_texts.py           # ★ 重打包 texts.zip（内置 slot0 压缩）
+│   ├── fix_charlist_endian.py    # 字表端序修正
+│   ├── fix_space_wrap.py         # 字典补空格 + 压空格 + 重打包
+│   ├── out_fromscratch\          # 构建产物（不入 git，496MB）
+│   ├── original_dds\             # 原版参考字库（不入 git，25MB）
+│   └── _archive\                 # 一次性脚本 / 旧日志归档
+├── _archive\.temp_hist\          # 历史 .temp 脚本归档
+├── Release\ / packages\ / pakcrypt\
+└── .workbuddy\memory\            # 项目记忆（不入 git）
 ```
 
 ---
 
-## 八、待办事项
+## 9. 关键文件速查
 
-### 8.1 部署测试
-1. 将 DLL 改扩展名为 `.asi`，放入游戏 update 目录
-2. 部署 UTF-8 编码的 DictRead.txt
-3. 启动游戏验证：
-   - 中文连续显示无间隙（零宽字形生效）
-   - 词典替换生效（UI/任务/单位名称）
-   - 无崩溃/卡顿
-
-### 8.2 加载方式
-当前 DLL 需要通过代理 DLL 注入（原版使用 winmm.dll 代理，或 binkw64.dll 代理）。
-release 包中已有 winmm.dll（2.3MB 代理 DLL）。
-
-### 8.3 词典定稿
-基于 V0 版本修复 P0 条目（350条），生成 UTF-8 编码的最终版 DictRead.txt。
-
-### 8.4 字库覆盖缺口
-词典中 2708 个不同汉字中，约 940~1015 个不在 charlist（6995 字）中。
-这些字会 fallback 到索引 0x100（第一个中文字形），显示为错误的字。
-需要扩展 charlist 或更换更完整的字库。
+| 路径 | 说明 |
+|------|------|
+| `MajestyII_UTF8/dllmain.cpp` | 主代码。`g_charlist_data[]` 在 478 行起；状态机 3476 行；`ApplyHooks()` 3726 行 |
+| `MajestyII_UTF8/charlist_data.h` | 字表（自动生成，勿手改） |
+| `fontgen/font_fromscratch.yaml` | 19 套字体配置，`space_advance: 2` |
+| `fontgen/out_fromscratch/*.tuv` | 16 个 TUV，`TUVCOUNT 24164` |
+| `update/MajestyII_GB18030_2000.asi` | 线上插件 |
+| `update/DictRead.txt` | 简体词典（GBK，已补空格） |
+| `update/DictRead_V7_CHT.txt` | 繁体词典（UTF-8，已补空格） |
+| `update/localization/texts/texts.zip` | 字库加载路径 |
+| `update/global.ini` | `OverloadFromFolder=update_cht` 简繁开关 |
 
 ---
 
-## 九、关键技术细节
+## 10. 常用命令
 
-### 9.1 状态机状态布局
+```bash
+# 构建字库（19 套，~3.5min）
+cd G:/Projects/MajestyIIExtend/fontgen
+python build_font_atlas.py font_fromscratch.yaml
 
-```
-g_stateN[12 字节]:
-  [0]  flag  (BYTE)   - 0=等待lead, 1=等待byte2, 2=等待byte3
-  [4]  b1    (DWORD)  - 第一字节+0x20（UTF-8 lead 0xE0~0xEF+0x20 溢出 8 位，需 DWORD）
-  [8]  b2    (DWORD)  - 第二字节+0x20
-```
+# 编译 + 部署（Git Bash）
+cd G:/Projects/MajestyIIExtend && bash build_deploy.sh
 
-### 9.2 wrapper 传参模式
+# 编译 + 部署（cmd）
+cd /d G:\Projects\MajestyIIExtend && build.bat
 
-```asm
-; inner wrapper (e.g. sub_70003770):
-push offset g_stateN      ; arg2 = 状态指针
-push eax                  ; arg1 = 字节+0x20
-mov edx, offset g_stateN+4 ; edx = b1 存储指针
-call sub_700036A0         ; 状态机
-; 返回 eax = 字形索引 - 0x20
-```
+# 字典补空格 + 压空格步进 + 重打包 zip
+python fontgen/fix_space_wrap.py --dict <路径>
 
-### 9.3 pushad wrapper 模式
+# 只重打包 texts.zip（会重新压 slot0，幂等）
+python fontgen/repack_texts.py <路径>/texts.zip
 
-```asm
-; outer wrapper (e.g. sub_700037A0):
-pushad
-push esp           ; pushad 后的 esp 指向 pushad 保存区
-call inner_wrapper ; inner 读取 [esp+8] = pushad 区 = 原始 esi/edi
-popad
-ret
+# 空槽统计
+python fontgen/audit_coverage.py
 ```
 
-### 9.4 字形表地址计算
+---
 
-```
-字形表基址 = 0xA0BC18
-每个字形 = 32 字节 (shl 5)
-字形地址 = 基址 + glyph_index * 32
-宽度 = float[字形地址+0x18] - float[字形地址+0]
+## 11. 已知遗留 / 待办
 
-索引 0xDF → 字形@0xA0D7F8, 宽度@0xA0D810 (零宽补丁目标)
-索引 0xFF → 字形@0xA0DBF8, 宽度@0xA0DC10 (未补零)
-索引 0x100 → 字形@0xA0DC18 (第一个中文字形)
-```
+1. **空槽 2151**：`build_font_atlas.py` 自检报「空槽(无字形/缺失码点)数：2151」。
+   疑似一批规律区间码点（如 `0x1C53~0x1C63`）在字表里有、但字体缺字。
+   **待分析**：是 charlist 冗余区，还是所选字体确实缺这些码点。
+   （影响：这些字写空槽，不显示方框，但也不显示内容。）
+2. **`update/` 目录里 .bak 与其他语言文件混杂**：属游戏目录，未纳入本仓库。
+3. **`fontgen/original_dds` / `texconv.exe` 不入 git**：体积原因（25MB / 第三方工具）。
+4. **构建脚本已统一**：`build_deploy.sh`（Git Bash，**已实测通过**）与
+   `build.bat`（cmd，结构等价）是仅有的两套入口，
+   `MajestyII_UTF8/build_asi.ps1` 为冗余第三套（用 BuildTools 路径 + SDK 19041），
+   **已归档到 `_archive/build_asi.ps1.redundant`**，不建议再用。
+
+> 注：本机环境无法从自动化工具直接调 `cmd.exe` / PowerShell 跑 cl.exe，
+> 所以 `build.bat` 只做了结构复核（与 `.sh` 同一 cl、同一 flags、同一 Windows 路径），
+> 未做端到端实测。**日常建议用 `bash build_deploy.sh`**（已实测）。
+
+---
+
+## 12. 历史时间线
+
+| 日期 | 里程碑 |
+|------|--------|
+| 2026-08-31 | 俄译中完成：`M2_mod.loctable.xml` col5 写入 2260 行译文 |
+| 2026-09-03 | 词典校对：V0/V1/Eng 三方比对，7264 条 KEY 一致 |
+| 2026-09-06 | 8 个过场视频简繁字幕完成并部署 |
+| 2026-09-06 | DLL 工程创建 |
+| 2026-09-07 | ~~UTF-8 三字节重构~~（后已回退） |
+| 2026-09-10 | 字表端序修正（追加段原码 → 小端）；状态机阈值 `0xA0 → 0x80`；
+|             | 字典 compact 断行根因定位 + 补空格；`space_advance: 2` 空格槽压缩；
+|             | 繁体字典同步；仓库整理 + 本文档重写 |
