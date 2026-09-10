@@ -259,3 +259,67 @@ paket-files/
 # Python Tools for Visual Studio (PTVS)
 __pycache__/
 *.pyc
+
+
+# ============================================================
+# MajestyIIExtend 项目专用规则
+# ============================================================
+
+# --- 归档目录：历史脚本 / 旧构建日志 / 旧 .bak，只作考古，不入版本控制 ---
+_archive/
+**/_archive/
+
+# --- 备份文件 ---
+*.bak
+*.bak_*
+*.orig
+
+# --- 字库构建产物（体积巨大，可随时用 build_font_atlas.py 重建） ---
+#   单个字体集 ~26MB（19 套 DDS+TUV+PNG），全量 496MB，绝不该进 git。
+fontgen/out_fromscratch/
+fontgen/out_append/
+fontgen/out_*/
+fontgen/_test_out/
+
+# --- 字库构建中间件 / 临时文件 ---
+fontgen/*.log
+fontgen/_archive/
+fontgen/_test_build.yaml
+
+# --- 字体源文件（大 TTF，由用户自行放置；不入库，避免仓库爆炸） ---
+#   注意：如果你是 clone 本仓库，请自行下载注释中列出的字体放到 fontgen/ 下。
+fontgen/*.ttf
+fontgen/*.otf
+fontgen/*.ttc
+
+# --- 编译产物 ---
+Release/
+Debug/
+x64/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+MajestyII_UTF8/*.dll
+MajestyII_UTF8/*.asi
+MajestyII_UTF8/charlist_data.h
+
+# --- 第三方包缓存 ---
+packages/
+pakcrypt/
+
+# --- 会话工作区（本机 AI 记忆，不入库） ---
+.workbuddy/
+
+# --- 游戏内运行日志（调试时产生，绝不入库） ---
+*_log.txt
+MJ2_log.txt
+DictRead.txt2
+# --- 原版参考字库（从游戏里提取的对照样本，25MB DDS；用于逆向对照） ---
+#   若需要保留，可单独 git add -f fontgen/original_dds/
+fontgen/original_dds/
+
+# --- texconv 第三方二进制工具（微软 DirectXTex，可自行下载） ---
+fontgen/texconv.exe

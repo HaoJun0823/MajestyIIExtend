@@ -1,0 +1,45 @@
+# ============================================================================
+# 字体图集生成器 示例配置（YAML）
+# 用法： python build_font_atlas.py font_config.yaml
+# 相对路径均相对于本配置文件所在目录；绝对路径原样使用。
+# ============================================================================
+
+# ---- 全局设置（所有字体共享） ----
+charlist: "charlist.txt"        # GBK 编码的中文字符库，追加在 CP1252 基础字符集之后
+output_dir: "out"               # 输出目录（自动创建）
+atlas_width: 2048               # 图集宽度，必须是 512 的正整数倍，高度自动按512倍数增长
+padding: 1                      # 打包时字符之间的间距(px)
+texconv: ""                     # texconv.exe 绝对路径；留空则自动搜索脚本/工作目录/PATH
+
+# ---- 字体通用默认值（可被每个字体覆盖） ----
+defaults:
+  render_mode: "smooth"         # smooth=平滑抗锯齿 / binary=硬边二值化
+  sharpness: 1.5                # 平滑模式锐度(1.0~3.0，越大越锐利)
+  bold: false                   # 平滑模式是否加粗
+  supersample: 2                # 平滑模式超采样倍数(2/3/4，越高越顺滑但更慢)
+  threshold: 128                # 二值模式阈值(0~255)
+  zero_space_width: false       # 空格保留单元格宽度（零宽会致空格“不前进/被截断”）
+  padding_top: 0                # 字盒四向下边距/左边距/右边距
+  padding_bottom: 0
+  padding_left: 0
+  padding_right: 0
+  auto_dds: true                # 是否用 texconv 转 DXT5 DDS
+  patch_png: ""                 # 可选 $.png 补丁路径（四向边距相等才生效，覆盖索引4=$字符）
+
+# ---- 字体列表（至少一项；每项生成 <prefix>.png/.dds/.tuv） ----
+fonts:
+  - prefix: "font_ui"                        # 输出文件名前缀
+    font_path: "C:/Windows/Fonts/simsun.ttc" # 宋体（游戏常用）
+    size: 32
+
+  - prefix: "font_title"
+    font_path: "C:/Windows/Fonts/simhei.ttf" # 黑体
+    size: 36
+    sharpness: 2.0                           # 覆盖 defaults
+    supersample: 3
+
+  - prefix: "font_binary"
+    font_path: "C:/Windows/Fonts/msyh.ttc"   # 微软雅黑
+    size: 28
+    render_mode: "binary"                    # 二值化模式
+    threshold: 140
