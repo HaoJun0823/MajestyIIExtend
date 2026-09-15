@@ -51,6 +51,7 @@ static DWORD g_fileOpenCount = 0;          // ZipHook 观察到的文件打开�
 static DWORD g_redirectCount = 0;          // .pak -> .zip 重定向次数
 static DWORD g_dictEntries = 0;            // DictRead.txt 加载词条数
 static DWORD g_dictFileSize = 0;           // DictRead.txt 文件大小
+static DWORD g_dictRespaced = 0;           // 值串被动态插入空格的条数
 static DWORD g_lastFlushTick = 0;          // 上次统计落盘时刻 (ms)
 static const char* g_uniquePaths[MAX_UNIQUE_PATHS];
 static int g_uniquePathCount = 0;
@@ -3817,6 +3818,78 @@ static void Trim(char* s) {
         s[--len] = '\0';
 }
 
+// 在 GBK 值串中，为每个「汉字」（Unicode U+4E00..U+9FFF）后插入一个 ASCII 空格。
+// 规则与历史 fix_space_wrap.py 的 respace() 严格对齐：
+//   · 标签 <...> 内部不插空格；
+//   · 汉字后若已紧跟空格则不重复插；
+//   · 全角标点（不在 U+4E00..U+9FFF 内）不插空格。
+// 这样源字典可保持「干净无空格」格式，由 DLL 加载时动态补空格，便于管理译文。
+// 返回 HeapAlloc 的新串；失败时回退为原串副本（不插空格，保证不崩）。
+static char* RespaceCJK_GBK(const char* val) {
+    int vlen = StrLen(val);
+    if (vlen == 0) {
+        char* e = (char*)HeapAlloc(GetProcessHeap(), 0, 1);
+        if (e) e[0] = '\0';
+        return e;
+    }
+    // GBK(码页 936) -> UTF-16；严格模式：含非法字节则整行原样返回
+    int wcap = MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, val, vlen, NULL, 0);
+    if (wcap == 0) {
+        char* c = (char*)HeapAlloc(GetProcessHeap(), 0, vlen + 1);
+        if (c) MyMemcpy(c, val, vlen + 1);
+        return c;
+    }
+    wchar_t* w = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, (wcap + 1) * sizeof(wchar_t));
+    if (!w) return NULL;
+    MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, val, vlen, w, wcap);
+    w[wcap] = L'\0';
+
+    int wlen = wcap;
+    // 先统计需要插入的空格数
+    int extra = 0;
+    bool in_tag = false;
+    for (int i = 0; i < wlen; i++) {
+        wchar_t c = w[i];
+        if (c == L'<') in_tag = true;
+        else if (c == L'>') in_tag = false;
+        if (!in_tag && c >= 0x4E00 && c <= 0x9FFF) {
+            wchar_t nx = (i + 1 < wlen) ? w[i + 1] : L'\0';
+            if (nx != L'\0' && nx != L' ') extra++;
+        }
+    }
+    // 组装带空格的 UTF-16
+    int outcap = wcap + extra;
+    wchar_t* wo = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, (outcap + 1) * sizeof(wchar_t));
+    if (!wo) { HeapFree(GetProcessHeap(), 0, w); return NULL; }
+    int o = 0;
+    in_tag = false;
+    for (int i = 0; i < wlen; i++) {
+        wchar_t c = w[i];
+        if (c == L'<') { in_tag = true; wo[o++] = c; continue; }
+        if (c == L'>') { in_tag = false; wo[o++] = c; continue; }
+        wo[o++] = c;
+        if (!in_tag && c >= 0x4E00 && c <= 0x9FFF) {
+            wchar_t nx = (i + 1 < wlen) ? w[i + 1] : L'\0';
+            if (nx != L'\0' && nx != L' ') wo[o++] = L' ';
+        }
+    }
+    wo[outcap] = L'\0';
+
+    // UTF-16 -> GBK(936)
+    int blen = WideCharToMultiByte(936, 0, wo, outcap, NULL, 0, NULL, NULL);
+    char* out = NULL;
+    if (blen > 0) {
+        out = (char*)HeapAlloc(GetProcessHeap(), 0, blen + 1);
+        if (out) {
+            WideCharToMultiByte(936, 0, wo, outcap, out, blen, NULL, NULL);
+            out[blen] = '\0';
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, w);
+    HeapFree(GetProcessHeap(), 0, wo);
+    return out;
+}
+
 // 加载词典（格式：键行 / 值行 交替，值只占一行）
 static void LoadDict(void) {
     HANDLE h = CreateFileA(DICT_FILE, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -3853,18 +3926,24 @@ static void LoadDict(void) {
         if (key[0] == '\0' || val[0] == '\0') continue;
 
         DWORD crc = CRC32(key);
-        int vlen = StrLen(val);
-        char* copy = (char*)HeapAlloc(GetProcessHeap(), 0, vlen + 1);
-        if (copy) {
-            MyMemcpy(copy, val, vlen + 1);
-            HashInsert(crc, copy);
+        // 动态为范围内中文字符后加空格（源字典可保持干净无空格格式，便于管理译文）
+        char* stored = RespaceCJK_GBK(val);
+        if (!stored) {
+            int vlen = StrLen(val);
+            stored = (char*)HeapAlloc(GetProcessHeap(), 0, vlen + 1);
+            if (stored) MyMemcpy(stored, val, vlen + 1);
+        }
+        if (stored) {
+            HashInsert(crc, stored);
             g_dictEntries++;
+            if (StrLen(stored) > StrLen(val)) g_dictRespaced++;
         }
     }
     HeapFree(GetProcessHeap(), 0, buf);
     LogText("[LoadDict] done");
     LogNum("  entries = ", g_dictEntries, "");
     LogNum("  size    = ", g_dictFileSize, " bytes");
+    LogNum("  respaced= ", g_dictRespaced, "");
 }
 
 static char* FindTextByKey(const char* key) {
