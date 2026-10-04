@@ -330,3 +330,6 @@ DictRead.txt2
 fontgen/texconv.exe
 #   â˜… CI ä»é›¶çƒ˜ç„™éœ€ texconv.exe â†’ å·²æäº¤å…¥åº“ï¼Œåå‘æ”¾è¡Œã€‚
 !fontgen/texconv.exe
+
+# --- Ìá½»µÄºæ±º²úÎï font_auto_build£ºdds/tuv Èë¿â£¨CI Ö±½ÓÊ¹ÓÃ£¬Óë V15 Öğ×Ö½ÚÒ»ÖÂ£©£¬png Ô¤ÀÀÍ¼²»Èë¿â ---
+fontgen/font_auto_build/*.png
