@@ -197,7 +197,8 @@ with codecs.open(dst, 'w', enc) as f:
     f.write(converted)
 print('converted %d chars' % len(converted))
 '@
-    [System.IO.File]::WriteAllText($tmp, $py -replace "`n","`r`n", [System.Text.Encoding]::UTF8)
+    $pyBody = $py -replace "`n", "`r`n"
+    [System.IO.File]::WriteAllText($tmp, $pyBody, [System.Text.Encoding]::UTF8)
     try {
         & $PyExe $tmp $src $dst $encoding
         if ($LASTEXITCODE) { throw "OpenCC conversion failed" }
