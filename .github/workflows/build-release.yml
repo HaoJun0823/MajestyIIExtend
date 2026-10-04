@@ -8,7 +8,7 @@ name: build-release
 #   MajestyII-CHT-{date}-{time}.zip
 #
 # 触发：
-#   push(master)          —— 构建 + 校验 + 上传两个 zip 到 Artifacts；
+#   push(master/main/rebuild) —— 构建 + 校验 + 上传两个 zip 到 Artifacts；
 #                            随后 publish job 在**同一 run** 内按日期-时间打 tag
 #                            并发 Release（两个 ASCII 名 zip 附件），无需手动打 tag。
 #   pull_request          —— 构建 + 校验（门禁，不发布）
@@ -29,14 +29,14 @@ name: build-release
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, rebuild]
     paths-ignore:
       - '**.md'
       - 'archives/**'
       - 'docs/**'
       - '.workbuddy/**'
   pull_request:
-    branches: [main, master]
+    branches: [main, master, rebuild]
     paths-ignore:
       - '**.md'
       - 'archives/**'
@@ -86,7 +86,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install opencc Pillow freetype-py
+          python -m pip install opencc Pillow freetype-py pyyaml fonttools numpy
 
       # ── 确保 v141 (MSVC 14.16) 编译器存在 ─────────────────────────────
       # cl.exe 直调，但这仍需 v141 工具链本体；镜像没有 → 现场装。
@@ -143,12 +143,12 @@ jobs:
           path: build_out/MajestyII-CHT-*.zip
           if-no-files-found: error
 
-  # ── 发布：push master 时自动打日期 tag + 发 Release ─────────────────
+  # ── 发布：push master/main/rebuild 时自动打日期 tag + 发 Release ─────────────────
   # 复刻 SR_GAME_CHINESE：不再依赖「tag push 重触发 workflow」（GITHUB_TOKEN
   # 推的 tag 不触发 on:push，会静默失败），改为在同一 run 内由 gh CLI 直接发版。
   publish:
     name: 发布 Release
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/rebuild') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
