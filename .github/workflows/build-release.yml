@@ -173,6 +173,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: 检出仓库（git tag 需要）
+        uses: actions/checkout@v4
       - name: 下载 CHS / CHT 两个 zip
         uses: actions/download-artifact@v4
         with:
@@ -182,12 +184,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="v$(date -u '+%Y%m%d-%H%M%S')"
-          # gh release create 会自动创建 tag，无需本地 git（publish job 没有 checkout 仓库）。
-          # 若同秒重跑（tag 已存在）则跳过，避免失败。
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "tag $tag 已存在，跳过"
-            exit 0
-          fi
+          # 用 GITHUB_TOKEN 建 tag 不会触发新的 on:push run；直接 gh release create。
+          # 先显式建 tag（anchor 到当前 commit），再打 Release。
+          echo "创建 tag: $tag"
+          git tag "$tag"
           echo "发布 Release: $tag"
           gh release create "$tag" \
             "dist/mj2-chs/MajestyII-CHS-"*.zip \
