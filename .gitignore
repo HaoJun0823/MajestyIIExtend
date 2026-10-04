@@ -266,8 +266,8 @@ __pycache__/
 # ============================================================
 
 # --- 归档目录：历史脚本 / 旧构建日志 / 旧 .bak，只作考古，不入版本控制 ---
-_archive/
-**/_archive/
+#   2026-10-02 由 _archive/ 统一改名为 archives/（原根级 + fontgen/ 两处）。
+archives/
 
 # --- 备份文件 ---
 *.bak
@@ -283,7 +283,6 @@ fontgen/_test_out/
 
 # --- 字库构建中间件 / 临时文件 ---
 fontgen/*.log
-fontgen/_archive/
 fontgen/_test_build.yaml
 
 # --- 字体源文件（大 TTF，由用户自行放置；不入库，避免仓库爆炸） ---
@@ -291,6 +290,9 @@ fontgen/_test_build.yaml
 fontgen/*.ttf
 fontgen/*.otf
 fontgen/*.ttc
+#   ★ CI 需从零烘焙字库 → 已将实际 TTF 提交入库，反向放行这两个：
+!fontgen/SourceHanSansHWSC-VF.ttf
+!fontgen/unifont-16.0.04.ttf
 
 # --- 编译产物 ---
 Release/
@@ -304,11 +306,13 @@ x64/
 *.log
 MajestyII_UTF8/*.dll
 MajestyII_UTF8/*.asi
-MajestyII_UTF8/charlist_data.h
+#   ★ charlist_data.h 是「已跟踪文件」（字表唯一权威源，铁律一），**故意不忽略**。
+#     它曾在 ignore 列表里 —— 规则对已跟踪文件不生效，故当时无害；但一旦有人
+#     `git rm --cached` 它，字表就会变成未跟踪且被静默忽略的新文件，clone 出的
+#     仓库缺失字表 → 贴图槽位全错 → 整体乱码。故移除此行。
 
 # --- 第三方包缓存 ---
 packages/
-pakcrypt/
 
 # --- 会话工作区（本机 AI 记忆，不入库） ---
 .workbuddy/
@@ -318,8 +322,11 @@ pakcrypt/
 MJ2_log.txt
 DictRead.txt2
 # --- 原版参考字库（从游戏里提取的对照样本，25MB DDS；用于逆向对照） ---
-#   若需要保留，可单独 git add -f fontgen/original_dds/
-fontgen/original_dds/
+#   ★ CI 从零烘焙需 original_dds/ 作 special 图源 → 已提交入库，反向放行。
+!fontgen/original_dds/
+!fontgen/original_dds/*
 
 # --- texconv 第三方二进制工具（微软 DirectXTex，可自行下载） ---
 fontgen/texconv.exe
+#   ★ CI 从零烘焙需 texconv.exe → 已提交入库，反向放行。
+!fontgen/texconv.exe

@@ -1,0 +1,180 @@
+name: build-release
+
+# ============================================================================
+# MajestyIIExtend 汉化补丁构建 + 自动发 Release
+# ----------------------------------------------------------------------------
+# 产物（CHS / CHT 两个独立 zip，均可直接解压到游戏根目录）：
+#   MajestyII-CHS-{date}-{time}.zip
+#   MajestyII-CHT-{date}-{time}.zip
+#
+# 触发：
+#   push(master)          —— 构建 + 校验 + 上传两个 zip 到 Artifacts；
+#                            随后 publish job 在**同一 run** 内按日期-时间打 tag
+#                            并发 Release（两个 ASCII 名 zip 附件），无需手动打 tag。
+#   pull_request          —— 构建 + 校验（门禁，不发布）
+#   workflow_dispatch     —— 手动；可勾选跳过烘焙 / 跳过 DLL 编译
+#
+# ★ 编译路线 = cl.exe 直调（v141_xp，32 位 DLL），不是 MSBuild：
+#   - 完全复刻 build_deploy.sh / build.bat 的 flags，产出无 CRTer
+#   - 不依赖 NuGet restore（dllmain.cpp 不用 MinHook），也不需要 Windows SDK
+#     7.1A（那是 v141_xp 在 MSBuild 里才强制的坑）
+#   - windows-2022 镜像默认不带 v141 编译器 → 先经 VS Installer 现场安装
+#     Microsoft.VisualStudio.Component.VC.v141.x86.x64，再用 vswhere 动态发现 cl.exe
+#
+# ★ 字体烘焙（from_scratch）需要把以下文件提交进 git（.gitignore 已放行）：
+#   fontgen/*.ttf、fontgen/original_dds/、fontgen/texconv.exe、
+#   fontgen/DictRead_V14_GB18030.txt
+#   这些不在就无法烘焙字库，release 会缺字库。
+# ============================================================================
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'archives/**'
+      - 'docs/**'
+      - '.workbuddy/**'
+  pull_request:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'archives/**'
+      - 'docs/**'
+      - '.workbuddy/**'
+  workflow_dispatch:
+    inputs:
+      skip_bake:
+        description: '跳过字体烘焙（用已提交的 Resource 成品字库 —— CI 上一般不要勾，否则包可能缺字库）'
+        type: boolean
+        default: false
+      skip_dll:
+        description: '跳过 DLL 编译（仅重建资源包，需已有 dll 产物 —— CI 上不要勾）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 同一分支/PR 的新推送取消旧的进行中构建，省 runner
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建发布包
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    env:
+      # 本仓库所有 .py 都与中文交互；CI 上强制 UTF-8，避免 UnicodeEncodeError
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+
+      # ── 环境准备 ─────────────────────────────────────────────────────
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 Python 依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install opencc Pillow freetype-py
+
+      # ── 确保 v141 (MSVC 14.16) 编译器存在 ─────────────────────────────
+      # cl.exe 直调，但这仍需 v141 工具链本体；镜像没有 → 现场装。
+      # 装的是 `VC.v141.x86.x64`（含 cl.exe + 库）；glm/x86 不在其列，无碍。
+      - name: 安装 v141 工具集（VC.v141.x86.x64）
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $found = if (Test-Path $vsw) {
+            $p = & $vsw -latest -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null
+            if ($p) { $p | Select-Object -First 1 } else { $null }
+          } else { $null }
+          if ($found) {
+            Write-Host "已存在 v141 cl.exe: $found"
+          } else {
+            Write-Host "未找到 v141 cl.exe，经 VS Installer 安装 VC.v141.x86.x64 ..."
+            $candidates = @(
+              "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe",
+              "C:\Program Files\Microsoft Visual Studio\Installer\setup.exe"
+            )
+            $setup = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $setup) { throw "找不到 VS Installer setup.exe，无法安装 v141" }
+            & $setup modify --installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" `
+              --add Microsoft.VisualStudio.Component.VC.v141.x86.x64 `
+              --quiet --norestart --wait
+            if ($LASTEXITCODE -ne 0) { throw "VS Installer 安装 v141 失败 (rc=$LASTEXITCODE)" }
+            # 装到的 BuildTools 实例要在 vswhere 里能被 -all 看到（默认 -latest 可能选不到），
+            # 但我们脚本会先找 BuildTools 实例，再 -all 兜底 → 交给 build_release.ps1 的发现逻辑。
+          }
+
+      # ── 核心：装配脚本 ─────────────────────────────────────────────
+      - name: 运行 build_release.ps1
+        shell: pwsh
+        run: |
+          $skipArgs = @()
+          if ("${{ github.event.inputs.skip_bake }}" -eq 'true') { $skipArgs += '-SkipBake' }
+          if ("${{ github.event.inputs.skip_dll }}" -eq 'true') { $skipArgs += '-SkipDll' }
+          Write-Host ">>> 参数: $($skipArgs -join ' ')"
+          & "$PWD\tools\build_release.ps1" @skipArgs -OutDir "build_out"
+          if ($LASTEXITCODE -ne 0) { throw "build_release.ps1 失败 rc=$LASTEXITCODE" }
+
+      # ── 上传 Artifact ─────────────────────────────────────────────
+      - name: 上传 CHS 发布包
+        uses: actions/upload-artifact@v4
+        with:
+          name: mj2-chs
+          path: build_out/MajestyII-CHS-*.zip
+          if-no-files-found: error
+      - name: 上传 CHT 发布包
+        uses: actions/upload-artifact@v4
+        with:
+          name: mj2-cht
+          path: build_out/MajestyII-CHT-*.zip
+          if-no-files-found: error
+
+  # ── 发布：push master 时自动打日期 tag + 发 Release ─────────────────
+  # 复刻 SR_GAME_CHINESE：不再依赖「tag push 重触发 workflow」（GITHUB_TOKEN
+  # 推的 tag 不触发 on:push，会静默失败），改为在同一 run 内由 gh CLI 直接发版。
+  publish:
+    name: 发布 Release
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 下载 CHS / CHT 两个 zip
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: 打日期 tag + 发布 Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(date -u '+%Y%m%d-%H%M%S')"
+          # 若 tag 不存在则打 tag；已存在（极少）则跳过打 tag
+          if ! gh release view "release-$tag" >/dev/null 2>&1; then
+            echo "创建 tag: v$tag"
+            git tag "v$tag"
+            git push origin "v$tag"
+          fi
+          echo "发布 Release: v$tag"
+          gh release create "v$tag" \
+            "dist/mj2-chs/MajestyII-CHS-"*.zip \
+            "dist/mj2-cht/MajestyII-CHT-"*.zip \
+            --title "Majesty II 汉化补丁 v$tag" \
+            --notes "自动构建 CHS/CHT 汉化补丁。详见仓库 README。"
+          echo "✅ 已发布: v$tag"

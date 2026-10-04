@@ -1,0 +1,79 @@
+# ============================================================================
+# 从 0 重建 Majesty 2 字库（from_scratch 模式 · 从 DLL 派生）
+# ----------------------------------------------------------------------------
+# 根因（用户实测 + 汇编 sub_700036A0 确认）：引擎对 CJK 的处理是
+#     dx = 字符 GBK 双字节值 → 在 g_charlist_data[] 按值查找下标 i → slot = i+224
+# 因此「字符→槽位」完全由 g_charlist_data 的下标顺序决定。用户已确认：
+#   GB18030/GBK 字节序（原老字库所用）是正确的序，Unicode 码点序会乱码。
+#
+# 本配置 charlist_source: dll —— 贴图 CJK 区顺序【直接读 dllmain.cpp 的
+# g_charlist_data[] 派生】，与 DLL 物理同源同序，100% 不可能错位。DLL 由
+# apply_dll_charlist_patch.py 写回 GB18030 序（charlist_full_gb18030.txt 为源）。
+#
+#   - 拉丁 0x20–0xFF(224 槽) 用 ttf_chain 渲染（slot=码点-0x20 固定位置），
+#     0x24/0xFF 等 special_from_original 从 original_dds 抠原图覆盖（游戏图标）
+#   - CJK 区(槽 224+) 按 dllmain.cpp g_charlist_data[] 顺序逐个渲染
+#   - 画布尺寸按 字数×字号 自动计算（行优先货架打包）
+#   - 输出 atlas_width × atlas_height 画布 + DDS(DXT5) + .tuv
+#
+# 🔴 size = CJK 格宽，也是引擎「每汉字步进」的基准。**必须逐字体对齐原版**：
+#      small(_c) 16、paragraph(_c) 20、med_caption(_c) 19、big_caption(_c) 24、
+#      console 16、font12 12、font14 14、font18 18。
+#   原版实测「CJK 格宽 + 其后空格步进 = 每汉字总步进」：
+#      small_c 16+7=23、med_caption_c 19+16=35、paragraph_c 20+16=36。
+#   2026-09-10 之前一律 size:14 → paragraph_c 只有原版行宽的 61%，
+#   导致 briefing(ex. #PP11_BRIEFING)/教程等长串换行、悬挂缩进错位、文字消失。
+# ============================================================================
+
+SRC: "original_dds"
+output_dir: "font_auto_build"
+charlist_source: "dll"                         # 贴图顺序直接由 DLL 的 g_charlist_data[] 派生（权威、不可错位）
+dll_cpp: "../MajestyII_UTF8/dllmain.cpp"      # 仅 charlist_source=dll 时使用
+used_chars_txt: "../Text/DictRead.txt"   # 汉化译文字典(GB18030，V14，去重 2806 字/2724 汉字)。复用 Text/DictRead.txt —— 与 archives 里的 DictRead_V14_GB18030.txt 完全同文件(md5 一致)，避免仓库重复存放。
+                                          # 若要覆盖全部游戏文本(含 UI 串)，把全量文本并入此文件或另建 all_game_text_gb18030.txt 再改回。
+atlas_width: 4096          # 画布基准宽（自动模式会按需放大到 2 的幂）
+atlas_height: 4096
+output_format: "dxt5"      # dxt5(默认,BC3) | bgra(32位无损)
+padding: 1
+texconv: ""                # 留空自动查找 fontgen/texconv.exe（DXT5 需要时）
+start_code: 0x20      # 仅拉丁区/范围模式回退用
+end_code: 0xFF        # 仅范围模式回退用
+
+defaults:
+  render_mode: "native"    # 原生 1x 绘制（FreeType 自带抗锯齿）；不使用超采样/LANCZOS，避免白边变灰
+  supersample: 1
+  sharpness: 0.5
+  zero_space_width: false
+  size: 16
+  # 🔴 空格槽 slot0 目标步进（px）。字典补空格后，每个汉字背后都有 ASCII 空格当
+  #    断行点；引擎「步进 = 下一槽 x0 − 本槽 x0」，故须把 slot0.x0 前移到
+  #    slot1.x0 − space_advance，否则界面会变成「学 习 治 理」的大间距。
+  #    2 = 实机验证值（用户确认「效果极好」）。设 null / 删掉此行 = 保持自然格宽。
+  space_advance: 8
+  ttf_chain:               # ← 叠加/回退 TTF 链（按顺序尝试，首选没字试下一个）
+    - "SourceHanSansHWSC-VF.ttf"      
+    - "unifont-16.0.04.ttf"
+
+fonts:
+  # ---- small 家族（0x24 钱图标）· 原版 CJK 14 ----
+  - { prefix: "small",        size: 16, special_from_original: [0x24], source_dds: "!!SRC/small.dds",        source_tuv: "!!SRC/small.tuv" }
+  - { prefix: "small_c",      size: 16, outline: true, special_from_original: [0x24], source_dds: "!!SRC/small_c.dds",      source_tuv: "!!SRC/small_c.tuv" }
+
+  # ---- big_caption（0x24 钱图标）· 原版 CJK 18 ----
+  - { prefix: "big_caption",  size: 20, special_from_original: [0x24], source_dds: "!!SRC/big_caption.dds",   source_tuv: "!!SRC/big_caption.tuv" }
+  - { prefix: "big_caption_c",size: 20, outline: true, special_from_original: [0x24], source_dds: "!!SRC/big_caption_c.dds", source_tuv: "!!SRC/big_caption_c.tuv" }
+  # ---- console 纯 TTF · 原版 CJK 18 ----
+  - { prefix: "console",      size: 20 }
+  # ---- paragraph（0x24 钱图标）· 原版 CJK 14 ----
+  - { prefix: "paragraph",    size: 16, special_from_original: [0x24], source_dds: "!!SRC/paragraph.dds",     source_tuv: "!!SRC/paragraph.tuv" }
+  - { prefix: "paragraph_c",  size: 16, outline: true, special_from_original: [0x24], source_dds: "!!SRC/paragraph_c.dds",   source_tuv: "!!SRC/paragraph_c.tuv" }
+  # ---- font12/14/18（0xFF 饼干图标，a/b 共享 .tuv）· 原版 CJK 12/14/18 ----
+  - { prefix: "font12a",      size: 14, special_from_original: [0xFF], source_dds: "!!SRC/font12a.dds", source_tuv: "!!SRC/font12.tuv", tuv_out: "font12" }
+  - { prefix: "font12b",      size: 14, bold: true, special_from_original: [0xFF], source_dds: "!!SRC/font12b.dds", source_tuv: "!!SRC/font12.tuv", tuv_out: "font12" }
+  - { prefix: "font14a",      size: 16, special_from_original: [0xFF], source_dds: "!!SRC/font14a.dds", source_tuv: "!!SRC/font14.tuv", tuv_out: "font14" }
+  - { prefix: "font14b",      size: 16, bold: true, special_from_original: [0xFF], source_dds: "!!SRC/font14b.dds", source_tuv: "!!SRC/font14.tuv", tuv_out: "font14" }
+  - { prefix: "font18a",      size: 20, special_from_original: [0xFF], source_dds: "!!SRC/font18a.dds", source_tuv: "!!SRC/font18.tuv", tuv_out: "font18" }
+  - { prefix: "font18b",      size: 20, bold: true, special_from_original: [0xFF], source_dds: "!!SRC/font18b.dds", source_tuv: "!!SRC/font18.tuv", tuv_out: "font18" }
+  # ---- med_caption（0x24 钱图标）· 原版 CJK 18 ----
+  - { prefix: "med_caption",  size: 20, special_from_original: [0x24], source_dds: "!!SRC/med_caption.dds",   source_tuv: "!!SRC/med_caption.tuv" }
+  - { prefix: "med_caption_c",size: 20, outline: true, special_from_original: [0x24], source_dds: "!!SRC/med_caption_c.dds", source_tuv: "!!SRC/med_caption_c.tuv" }

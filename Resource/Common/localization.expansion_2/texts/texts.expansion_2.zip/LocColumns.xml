@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<LocColumns xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="Schemas\LocColumns.xsd">
+	<LocalizationColumns>
+		<i_codePage>1252</i_codePage>
+		<i_key>1</i_key>
+		<i_value>5</i_value>
+		<i_comment>3</i_comment>
+	</LocalizationColumns>
+	<ReferenceColumns>
+		<i_codePage>1252</i_codePage>
+		<i_key>1</i_key>
+		<i_value>5</i_value>
+		<i_comment>3</i_comment>
+	</ReferenceColumns>
+	<PlatformData>
+	    <s_platform>PC</s_platform>
+	</PlatformData>
+	<Credits>
+	    <s_fileName>M2_Credits.eng.loctable.xml</s_fileName>
+	</Credits>
+</LocColumns>
