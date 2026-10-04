@@ -110,10 +110,27 @@ jobs:
             )
             $setup = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
             if (-not $setup) { throw "找不到 VS Installer setup.exe，无法安装 v141" }
+            # 注意：setup.exe 不支持 --wait（报 Option unknown 且不装）→ 去掉，
+            # 安装异步返回，下面轮询 vswhere 等 v141 真实出现（最多 10 分钟）。
             & $setup modify --installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" `
               --add Microsoft.VisualStudio.Component.VC.v141.x86.x64 `
-              --quiet --norestart --wait
-            if ($LASTEXITCODE -ne 0) { throw "VS Installer 安装 v141 失败 (rc=$LASTEXITCODE)" }
+              --quiet --norestart
+            if ($LASTEXITCODE -ne 0) { Write-Warning "VS Installer 安装 v141 返回 rc=$LASTEXITCODE（异步，下面轮询确认）" }
+            $deadline = (Get-Date).AddMinutes(10)
+            $installed = $null
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 15
+              $installed = & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null |
+                Select-Object -First 1
+              if ($installed) { break }
+            }
+            if ($installed) {
+              Write-Host "v141 安装完成: $installed"
+            } else {
+              # 装不上 v141 时允许 build_release.ps1 用新版 MSVC (14.29+/v142+) fallback 编译：
+              # cl 直调产物是 32 位无 CRT PE32 DLL，v142 与 v141_xp 行为一致（自实现 memcpy/__chkstk）。
+              Write-Warning "v141 在 10 分钟内未装好；build_release.ps1 将 fallback 到已存在的更新 MSVC 工具集"
+            }
             # 装到的 BuildTools 实例要在 vswhere 里能被 -all 看到（默认 -latest 可能选不到），
             # 但我们脚本会先找 BuildTools 实例，再 -all 兜底 → 交给 build_release.ps1 的发现逻辑。
           }
