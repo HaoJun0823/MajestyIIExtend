@@ -39,6 +39,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path -Parent $PSScriptRoot          # repo root
+# Force UTF-8 for every python child (bake script prints CJK/emoji like U+26A0
+# that would crash a GBK/cp1252 locale console -> UnicodeEncodeError).
+$env:PYTHONUTF8 = '1'
 $PY = Get-Command python -ErrorAction SilentlyContinue
 if (-not $PY) { $PY = Get-Command py -ErrorAction SilentlyContinue }
 if (-not $PY) { throw "python not found. Install Python 3.10+ and add it to PATH." }
@@ -284,14 +287,15 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
                 if ($rel -match '(?<dir>^.*[\\/])text\.zip$') {
                     $rel = $dir + 'texts.zip'
                 }
+                # Only texts.zip / texts.expansion_N.zip are zip files; launcher
+                # bitmaps etc. live outside those zip dirs and are copied directly.
+                if ($rel -notmatch '(?<![^\\/])texts(\.expansion_\d+)?\.zip$') { continue }
                 $targetZip = Join-Path $ud $rel
-                New-Item -ItemType Directory -Force -Path $targetZip | Out-Null
-                Get-ChildItem $z.FullName -Recurse -File | ForEach-Object {
-                    $relF = $_.FullName.Substring($z.FullName.Length + 1)
-                    $dstF = Join-Path $targetZip $relF
-                    New-Item -ItemType Directory -Force -Path (Split-Path $dstF -Parent) | Out-Null
-                    Copy-Item $_.FullName $dstF -Force
-                }
+                # The source *.zip dirs are EXPANDED zip trees; repack them into
+                # real zip FILES (matches the released texts*.zip structure).
+                New-Item -ItemType Directory -Force -Path (Split-Path $targetZip -Parent) | Out-Null
+                if (Test-Path $targetZip) { Remove-Item $targetZip -Force }
+                Compress-Archive -Path (Join-Path $z.FullName '*') -DestinationPath $targetZip -CompressionLevel Optimal
             }
         }
 
@@ -307,16 +311,28 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
             }
         }
 
-        # 4.5c if baked this run, overlay baked dds/tuv onto texts.zip/enGUIne/Fonts
+        # 4.5c if baked this run, overlay baked dds/tuv into texts.zip/enGUIne/Fonts
         if (-not $SkipBake -and (Test-Path $script:BakeOut)) {
-            $fontDst = Join-Path $ud "localization\texts\texts.zip\enGUIne\Fonts"
-            New-Item -ItemType Directory -Force -Path $fontDst | Out-Null
-            $moved = 0
-            Get-ChildItem $script:BakeOut -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -in '.dds','.tuv' } | ForEach-Object {
-                    Copy-Item $_.FullName (Join-Path $fontDst $_.Name) -Force
-                    $moved++
-                }
+            $textsZip = Join-Path $ud "localization\texts\texts.zip"
+            if (-not (Test-Path $textsZip)) { throw "missing $textsZip (need STEP 4.5 to produce it)" }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::Open($textsZip, [System.IO.Compression.ZipArchiveMode]::Update)
+            try {
+                $moved = 0
+                Get-ChildItem $script:BakeOut -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -in '.dds','.tuv' } | ForEach-Object {
+                        $name = "enGUIne/Fonts/$($_.Name)"
+                        $existing = $zip.GetEntry($name)
+                        if ($existing) { $existing.Delete() }
+                        $entry = $zip.CreateEntry($name)
+                        $es = $entry.Open()
+                        try {
+                            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+                            $es.Write($bytes, 0, $bytes.Length)
+                        } finally { $es.Close() }
+                        $moved++
+                    }
+            } finally { $zip.Dispose() }
             Write-Host "  overlaid $moved baked fonts into texts.zip [$lang]"
         }
 
@@ -355,11 +371,15 @@ Invoke-Step "STEP 5 · verify artifacts" {
                 if ($machine -ne 0x014c) { $errs += "asi machine=0x{0:x} not x86/PE32" -f $machine }
             }
         }
-        $tz = Join-Path $t "update\localization\texts\texts.zip\enGUIne\Fonts"
-        if (-not (Test-Path $tz)) { $errs += "missing fonts texts.zip dir" }
+        $tz = Join-Path $t "update\localization\texts\texts.zip"
+        if (-not (Test-Path $tz)) { $errs += "missing texts.zip file" }
         else {
-            $cdds = @(Get-ChildItem $tz -Filter '*_c.dds')
-            if ($cdds.Count -lt 4) { $errs += "CJK _c.dds insufficient (want >=4): got $($cdds.Count)" }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $z = [System.IO.Compression.ZipFile]::OpenRead($tz)
+            try {
+                $cdds = @($z.Entries | Where-Object { $_.FullName -match 'enGUIne/Fonts/.*_c\.dds' })
+                if ($cdds.Count -lt 4) { $errs += "CJK _c.dds insufficient inside texts.zip (want >=4): got $($cdds.Count)" }
+            } finally { $z.Dispose() }
         }
         if (-not (Test-Path (Join-Path $t "update\DictRead.txt"))) { $errs += "missing update\DictRead.txt" }
         foreach ($e in $errs) { Write-Host "  X $e" }
