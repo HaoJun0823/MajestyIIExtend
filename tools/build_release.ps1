@@ -38,6 +38,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# PS 7.3+ turns native stderr (e.g. python DeprecationWarning) into ErrorRecords;
+# with EAP=Stop that aborts the whole build. Keep stderr informational.
+$PSNativeCommandUseErrorActionPreference = $false
 $Repo = Split-Path -Parent $PSScriptRoot          # repo root
 # Force UTF-8 for every python child (bake script prints CJK/emoji like U+26A0
 # that would crash a GBK/cp1252 locale console -> UnicodeEncodeError).
@@ -189,14 +192,14 @@ function Convert-File-S2T([string]$src, [string]$dst, [string]$encoding) {
     # src/dst both GB18030; python opencc converts only CJK, keeps ASCII/tags/structure
     $tmp = Join-Path $env:TEMP ("mj2_{0}.py" -f ([guid]::NewGuid().ToString('N')))
     $py = @'
-import sys, codecs
+import sys
 from opencc import OpenCC
 cc = OpenCC('s2t')
 src, dst, enc = sys.argv[1], sys.argv[2], sys.argv[3]
-with codecs.open(src, 'r', enc) as f:
+with open(src, 'r', encoding=enc) as f:
     text = f.read()
 converted = cc.convert(text)
-with codecs.open(dst, 'w', enc) as f:
+with open(dst, 'w', encoding=enc) as f:
     f.write(converted)
 print('converted %d chars' % len(converted))
 '@
@@ -272,31 +275,150 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         New-Item -ItemType Directory -Force -Path $ud | Out-Null
         if ($lang -eq 'CHS') {
             $ds = Join-Path $Repo 'Text\DictRead.txt'
-            if (Test-Path $ds) { Copy-Item $ds (Join-Path $ud 'DictRead.txt') -Force }
+            if (Test-Path $ds) {
+                # CI checkout (`* text=auto` + core.autocrlf=true) turns DictRead into
+                # CRLF; strip every CR so the shipped dict stays LF (841910B) like the
+                # committed source — regardless of checkout policy.
+                $bytes = [System.IO.File]::ReadAllBytes($ds)
+                $out = New-Object 'System.Collections.Generic.List[byte]' ($bytes.Length)
+                for ($i = 0; $i -lt $bytes.Length; $i++) {
+                    if ($bytes[$i] -eq 13 -and $i + 1 -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+                    $out.Add($bytes[$i])
+                }
+                [System.IO.File]::WriteAllBytes((Join-Path $ud 'DictRead.txt'), $out.ToArray())
+            }
         }
 
         # 4.5 merge Resource into update/localization/**  (lang overrides Common)
+        # 4.5a localization\texts\texts.zip  =  Common meta (5) + lang logo (2 files + dirs)
+        #                                     + committed bake fonts (27) in V15 order (36 entries)
         $resCommon = Join-Path $Repo 'Resource\Common'
         $resLang   = Join-Path $Repo "Resource\$lang"
-        foreach ($base in @($resCommon, $resLang)) {
-            if (-not (Test-Path $base)) { continue }
-            $zipDirs = Get-ChildItem $base -Recurse -Directory -Filter '*.zip' -ErrorAction SilentlyContinue
-            foreach ($z in $zipDirs) {
-                $rel = $z.FullName.Substring($base.Length + 1)   # <relpath>\<X.zip>
-                # normalize: game actually reads texts.zip (Common tree labels it text.zip)
-                if ($rel -match '(?<dir>^.*[\\/])text\.zip$') {
-                    $rel = $dir + 'texts.zip'
-                }
-                # Only texts.zip / texts.expansion_N.zip are zip files; launcher
-                # bitmaps etc. live outside those zip dirs and are copied directly.
-                if ($rel -notmatch '(?<![^\\/])texts(\.expansion_\d+)?\.zip$') { continue }
-                $targetZip = Join-Path $ud $rel
-                # The source *.zip dirs are EXPANDED zip trees; repack them into
-                # real zip FILES (matches the released texts*.zip structure).
-                New-Item -ItemType Directory -Force -Path (Split-Path $targetZip -Parent) | Out-Null
-                if (Test-Path $targetZip) { Remove-Item $targetZip -Force }
-                Compress-Archive -Path (Join-Path $z.FullName '*') -DestinationPath $targetZip -CompressionLevel Optimal
+        # ZipArchiveMode lives in System.IO.Compression; ZipFile in
+        # System.IO.Compression.FileSystem — load BOTH before the helpers below
+        # reference the types (PS7/.NET Core keeps them in separate assemblies).
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+        $script:zipSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+
+        function Add-ZipEntry($zip, [string]$entryName, [byte[]]$bytes) {
+            # Create mode: $zip.Entries is always empty (stream not flushed), so
+            # dedupe via our own HashSet instead of scanning.
+            if ($script:zipSeen.Add($entryName) -eq $false) {
+                throw "duplicate zip entry: $entryName"
             }
+            $entry = $zip.CreateEntry($entryName)
+            $es = $entry.Open()
+            try { $es.Write($bytes, 0, $bytes.Length) } finally { $es.Close() }
+        }
+
+        function Add-ZipDirEntries($zip, [string]$entryName) {
+            # ensure parent dir entries exist (V15 zips carry them; game may rely on them).
+            # If the path ends in '/', every segment is a directory; otherwise the
+            # last segment is a file and only its parents become dir entries.
+            $isDir = $entryName.EndsWith('/')
+            $parts = $entryName -split '/'
+            $segCount = if ($isDir) { $parts.Length } else { $parts.Length - 1 }
+            $acc = ''
+            for ($i = 0; $i -lt $segCount; $i++) {
+                $p = $parts[$i]
+                if ($p -eq '') { continue }
+                $acc = if ($acc -eq '') { $p } else { "$acc/$p" }
+                $dirName = $acc + '/'
+                if ($script:zipSeen.Add($dirName) -eq $true) {
+                    $null = $zip.CreateEntry($dirName)
+                }
+            }
+        }
+
+        # -- 4.5a1 texts.zip: 36 entries in exact V15 order --
+        $textsZip = Join-Path $ud 'localization\texts\texts.zip'
+        New-Item -ItemType Directory -Force -Path (Split-Path $textsZip -Parent) | Out-Null
+        if (Test-Path $textsZip) { Remove-Item $textsZip -Force }
+        $tz = [System.IO.Compression.ZipFile]::Open($textsZip, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            $script:zipSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+            # meta from Common tree (V15-identical, verified)
+            $metaDir = Join-Path $resCommon 'localization\texts\text.zip'
+            # logo from lang tree
+            $logoDir = Join-Path $resLang 'localization\texts\texts.zip'
+            # fonts from committed bake output (byte-identical to V15)
+            $fontsDir = $script:BakeOut
+
+            $logo = Join-Path $logoDir 'enGUIne\Textures\gui_game_logo.dds'
+            $splash = Join-Path $metaDir 'enGUIne\Textures\splashscreen.bmp'
+            if (-not (Test-Path $logo)) { throw "missing logo $logo" }
+            if (-not (Test-Path $splash)) { throw "missing splashscreen $splash" }
+
+            Add-ZipDirEntries $tz 'enGUIne/'
+            Add-ZipDirEntries $tz 'enGUIne/Textures/'
+            Add-ZipEntry $tz 'enGUIne/Textures/gui_game_logo.dds' ([System.IO.File]::ReadAllBytes($logo))
+            Add-ZipEntry $tz 'enGUIne/Textures/splashscreen.bmp' ([System.IO.File]::ReadAllBytes($splash))
+            foreach ($metaName in @('LocColumns.xml','locdata.md','_ENGLISH_REFERENCE','_PLATFORM_PC')) {
+                $mp = Join-Path $metaDir $metaName
+                if (-not (Test-Path $mp)) { throw "missing meta $mp" }
+                Add-ZipEntry $tz $metaName ([System.IO.File]::ReadAllBytes($mp))
+            }
+            Add-ZipDirEntries $tz 'enGUIne/Fonts/'
+            # fonts in V15 order (dds,tuv,_c dds,_c tuv per family)
+            $fontOrder = @(
+                'big_caption.dds','big_caption.tuv','big_caption_c.dds','big_caption_c.tuv',
+                'console.dds','console.tuv',
+                'font12.tuv','font12a.dds','font12b.dds',
+                'font14.tuv','font14a.dds','font14b.dds',
+                'font18.tuv','font18a.dds','font18b.dds',
+                'med_caption.dds','med_caption.tuv','med_caption_c.dds','med_caption_c.tuv',
+                'paragraph.dds','paragraph.tuv','paragraph_c.dds','paragraph_c.tuv',
+                'small.dds','small.tuv','small_c.dds','small_c.tuv'
+            )
+            $fontCount = 0
+            foreach ($fn in $fontOrder) {
+                $fp = Join-Path $fontsDir $fn
+                if (-not (Test-Path $fp)) { throw "missing committed font $fp (bake output not committed?)" }
+                Add-ZipEntry $tz "enGUIne/Fonts/$fn" ([System.IO.File]::ReadAllBytes($fp))
+                $fontCount++
+            }
+            if ($fontCount -ne 27) { throw "expected 27 fonts in texts.zip, got $fontCount" }
+        } finally { $tz.Dispose() }
+        Write-Host "  texts.zip = 36 entries (meta+logo+27 fonts) [$lang]"
+
+        # -- 4.5a2 expansion_1..5 zips: Common markers/metadata + lang logo, V15 order --
+        foreach ($n in 1..5) {
+            $expZip = Join-Path $ud "localization.expansion_$n\texts\texts.expansion_$n.zip"
+            New-Item -ItemType Directory -Force -Path (Split-Path $expZip -Parent) | Out-Null
+            if (Test-Path $expZip) { Remove-Item $expZip -Force }
+            $ez = [System.IO.Compression.ZipFile]::Open($expZip, [System.IO.Compression.ZipArchiveMode]::Create)
+            try {
+                $script:zipSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+                $cExp = Join-Path $resCommon "localization.expansion_$n\texts\texts.expansion_$n.zip"
+                $lExp = Join-Path $resLang "localization.expansion_$n\texts\texts.expansion_$n.zip"
+                $cLogo = Join-Path $lExp 'enGUIne\Textures\gui_game_logo.dds'
+                if (-not (Test-Path $cLogo)) { throw "missing expansion_$n logo $cLogo" }
+                Add-ZipDirEntries $ez 'enGUIne/'
+                Add-ZipDirEntries $ez 'enGUIne/Textures/'
+                # expansion_2/3 carry extra interface + schema metadata from Common
+                if ($n -in 2,3) {
+                    foreach ($extra in @('enGUIne/Textures/splashscreen.bmp','interface/cs/version.con','LocColumns.xml','Schemas/LocColumns.xsd')) {
+                        $xp = Join-Path $cExp $extra
+                        if (-not (Test-Path $xp)) { throw "missing expansion_$n meta $xp" }
+                        Add-ZipDirEntries $ez $extra
+                        Add-ZipEntry $ez $extra ([System.IO.File]::ReadAllBytes($xp))
+                    }
+                    foreach ($mark in @('_ENGLISH_','_ENGLISH_REFERENCE','_PLATFORM_PC')) {
+                        $mp = Join-Path $cExp $mark
+                        if (-not (Test-Path $mp)) { throw "missing expansion_$n marker $mp" }
+                        Add-ZipEntry $ez $mark ([byte[]]@())
+                    }
+                } else {
+                    foreach ($mark in @('_ENGLISH_','_PLATFORM_PC')) {
+                        $mp = Join-Path $cExp $mark
+                        if (-not (Test-Path $mp)) { throw "missing expansion_$n marker $mp" }
+                        Add-ZipEntry $ez $mark ([byte[]]@())
+                    }
+                }
+                Add-ZipEntry $ez 'enGUIne/Textures/gui_game_logo.dds' ([System.IO.File]::ReadAllBytes($cLogo))
+            } finally { $ez.Dispose() }
         }
 
         # 4.5b update/localization/launcher
@@ -311,30 +433,8 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
             }
         }
 
-        # 4.5c if baked this run, overlay baked dds/tuv into texts.zip/enGUIne/Fonts
-        if (-not $SkipBake -and (Test-Path $script:BakeOut)) {
-            $textsZip = Join-Path $ud "localization\texts\texts.zip"
-            if (-not (Test-Path $textsZip)) { throw "missing $textsZip (need STEP 4.5 to produce it)" }
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $zip = [System.IO.Compression.ZipFile]::Open($textsZip, [System.IO.Compression.ZipArchiveMode]::Update)
-            try {
-                $moved = 0
-                Get-ChildItem $script:BakeOut -Recurse -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Extension -in '.dds','.tuv' } | ForEach-Object {
-                        $name = "enGUIne/Fonts/$($_.Name)"
-                        $existing = $zip.GetEntry($name)
-                        if ($existing) { $existing.Delete() }
-                        $entry = $zip.CreateEntry($name)
-                        $es = $entry.Open()
-                        try {
-                            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-                            $es.Write($bytes, 0, $bytes.Length)
-                        } finally { $es.Close() }
-                        $moved++
-                    }
-            } finally { $zip.Dispose() }
-            Write-Host "  overlaid $moved baked fonts into texts.zip [$lang]"
-        }
+        # 4.5c legacy: baked fonts are always taken from the committed BakeOut in
+        # 4.5a1 above; there is nothing left to overlay into texts.zip.
 
         # 4.6 support/ + DLC_Unlock.bat
         $sup = Join-Path $dist 'support'

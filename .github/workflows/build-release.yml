@@ -45,7 +45,7 @@ on:
   workflow_dispatch:
     inputs:
       skip_bake:
-        description: '跳过字体烘焙（用已提交的 Resource 成品字库 —— CI 上一般不要勾，否则包可能缺字库）'
+        description: '跳过字体烘焙（默认 false：正常 CI 不烘焙，直接复用已提交的 fontgen/font_auto_build 成品字库 —— 该字库已与 V15 逐字节一致）'
         type: boolean
         default: false
       skip_dll:
@@ -136,11 +136,13 @@ jobs:
           }
 
       # ── 核心：装配脚本 ─────────────────────────────────────────────
+      # CI 恒用已提交的 fontgen/font_auto_build 成品字库（与 V15 逐字节一致），
+      # 不现场重烘焙 —— 从零烘焙在 CI 上会产出 4096 尺寸的错误字库（已被 V15 判定为错）。
       - name: 运行 build_release.ps1
         shell: pwsh
         run: |
           $skipArgs = @()
-          if ("${{ github.event.inputs.skip_bake }}" -eq 'true') { $skipArgs += '-SkipBake' }
+          if ("${{ github.event.inputs.skip_bake }}" -eq 'true' -or "${{ github.event_name }}" -eq 'push') { $skipArgs += '-SkipBake' }
           if ("${{ github.event.inputs.skip_dll }}" -eq 'true') { $skipArgs += '-SkipDll' }
           Write-Host ">>> 参数: $($skipArgs -join ' ')"
           & "$PWD\tools\build_release.ps1" @skipArgs -OutDir "build_out"
