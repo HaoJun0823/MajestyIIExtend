@@ -141,10 +141,14 @@ jobs:
       - name: 运行 build_release.ps1
         shell: pwsh
         run: |
-          $skipArgs = @()
-          if ("${{ github.event.inputs.skip_bake }}" -eq 'true' -or "${{ github.event_name }}" -eq 'push') { $skipArgs += '-SkipBake' }
-          if ("${{ github.event.inputs.skip_dll }}" -eq 'true') { $skipArgs += '-SkipDll' }
-          Write-Host ">>> 参数: $($skipArgs -join ' ')"
+          # 用 hashtable splatting 而非字符串数组：@('-SkipBake') 展开时
+          # '-SkipBake' 会被当作位置参数（switch 不生效，PS5.1 静默绑到 OutDir、
+          # PS7 直接报 "positional parameter cannot be found"）。@{SkipBake=$true}
+          # 才能让 [switch] 参数正确生效。
+          $skipArgs = @{}
+          if ("${{ github.event.inputs.skip_bake }}" -eq 'true' -or "${{ github.event_name }}" -eq 'push') { $skipArgs.SkipBake = $true }
+          if ("${{ github.event.inputs.skip_dll }}" -eq 'true') { $skipArgs.SkipDll = $true }
+          Write-Host ">>> 参数: $($skipArgs.Keys -join ',')"
           & "$PWD\tools\build_release.ps1" @skipArgs -OutDir "build_out"
           if ($LASTEXITCODE -ne 0) { throw "build_release.ps1 失败 rc=$LASTEXITCODE" }
 
