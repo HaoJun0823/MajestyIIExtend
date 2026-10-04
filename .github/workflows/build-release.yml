@@ -18,8 +18,10 @@ name: build-release
 #   - 完全复刻 build_deploy.sh / build.bat 的 flags，产出无 CRTer
 #   - 不依赖 NuGet restore（dllmain.cpp 不用 MinHook），也不需要 Windows SDK
 #     7.1A（那是 v141_xp 在 MSBuild 里才强制的坑）
-#   - windows-2022 镜像默认不带 v141 编译器 → 先经 VS Installer 现场安装
-#     Microsoft.VisualStudio.Component.VC.v141.x86.x64，再用 vswhere 动态发现 cl.exe
+#   - windows-2022（= windows-latest，VS2022）镜像已自带 v141(MSVC 14.16) 工具集，
+#     直接 vswhere 动态发现 cl.exe 即可，无需现场安装（参考 cnc-ddraw 在 windows-latest
+#     直编 v141_xp，其 WinXP 组件安装步骤已注释掉 = 镜像自带）。windows-2019 已于
+#     2025 年前后下架，故不能用。
 #
 # ★ 字体烘焙（from_scratch）需要把以下文件提交进 git（.gitignore 已放行）：
 #   fontgen/*.ttf、fontgen/original_dds/、fontgen/texconv.exe、
@@ -64,10 +66,12 @@ concurrency:
 jobs:
   build:
     name: 构建发布包
-    # v141_xp 需要 VS2017 工具链：windows-2022/latest 镜像已移除 VS2017，
-    # 现场安装 VC.v141 常超时（实测 10 分钟装不完 → fallback 到 v142 产出错误 DLL）。
-    # windows-2019 镜像自带 VS2019 + VS2017 构建工具，v141 cl.exe 开箱即用。
-    runs-on: windows-2019
+    # v141_xp：windows-2022（VS2022 镜像）已自带 v141(MSVC 14.16) 工具集，
+    # 经 vswhere 发现 14.16 cl.exe 直编即可（参考 cnc-ddraw 在 windows-latest 编
+    # v141_xp，WinXP 组件安装步骤已注释掉 = 镜像自带）。windows-2019 已下架，不能用。
+    # 下方「检查 v141 工具集」步骤在找不到 14.16 时立即失败，杜绝静默回退到 v142
+    # （那会产出错误的 143872B DLL；正确的 v141_xp 产物是 144384B）。
+    runs-on: windows-2022
     timeout-minutes: 60
 
     env:
@@ -108,7 +112,7 @@ jobs:
             $legacy = "C:\Program Files (x86)\Microsoft Visual Studio\2017\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe"
             $p = (Get-ChildItem $legacy -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
           }
-          if (-not $p) { throw "未找到 v141 cl.exe（windows-2019 应自带 VC.v141 组件），无法产出 v141_xp DLL" }
+          if (-not $p) { throw "未找到 v141 cl.exe（windows-2022 应自带 VC.v141 组件），无法产出 v141_xp DLL" }
           Write-Host "v141 cl.exe 就绪: $p"
 
       # ── 核心：装配脚本 ─────────────────────────────────────────────
@@ -127,6 +131,34 @@ jobs:
           Write-Host ">>> 参数: $($skipArgs.Keys -join ',')"
           & "$PWD\tools\build_release.ps1" @skipArgs -OutDir "build_out"
           if ($LASTEXITCODE -ne 0) { throw "build_release.ps1 失败 rc=$LASTEXITCODE" }
+
+      # ── 产物体积闸门：杜绝错 DLL 流入发布 ────────────────────────────
+      # 正确 v141_xp asi = 144384B；若 CI 静默回退到 v142 会产出 143872B（错误），
+      # 这里在上传前断言两个 asi 体积都正确，异常则直接失败、绝不发错包。
+      - name: 校验 asi 体积（必须为 144384B v141_xp）
+        shell: pwsh
+        run: |
+          $want = 144384
+          foreach ($z in @('build_out/MajestyII-CHS-*.zip','build_out/MajestyII-CHT-*.zip')) {
+            $zip = Get-Item $z -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $zip) { throw "找不到构建产物: $z" }
+            # 在 zip 内定位 asi（update/MajestyII_GB18030_2000.asi）
+            $shell = New-Object -ComObject Shell.Application
+            $zp = $shell.NameSpace($zip.FullName)
+            $entry = $zp.Items() | ForEach-Object { $zp.GetDetailsOf($_, 0) } | Where-Object { $_ -match 'MajestyII_GB18030_2000\.asi$' } | Select-Object -First 1
+            if (-not $entry) { throw "未在 $($zip.Name) 内找到 MajestyII_GB18030_2000.asi" }
+            # 通过临时解压读取精确字节大小
+            $tmp = Join-Path $env:TEMP ("asi_$(Get-Random)")
+            New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+            try {
+              Expand-Archive -Path $zip.FullName -DestinationPath $tmp -Force
+              $asi = Get-ChildItem $tmp -Recurse -Filter 'MajestyII_GB18030_2000.asi' | Select-Object -First 1
+              if (-not $asi) { throw "解压后未找到 asi: $($zip.Name)" }
+              $sz = $asi.Length
+              if ($sz -ne $want) { throw "asi 体积错误: $($asi.Name) = $sz B（应为 $want B，疑似 v142 回退）" }
+              Write-Host "✓ $($zip.Name) -> asi $sz B"
+            } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+          }
 
       # ── 上传 Artifact ─────────────────────────────────────────────
       - name: 上传 CHS 发布包
