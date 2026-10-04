@@ -185,13 +185,13 @@ jobs:
           set -euo pipefail
           tag="v$(date -u '+%Y%m%d-%H%M%S')"
           # 用 GITHUB_TOKEN 建 tag 不会触发新的 on:push run；直接 gh release create。
-          # 先显式建 tag（anchor 到当前 commit），再打 Release。
-          echo "创建 tag: $tag"
-          git tag "$tag"
-          echo "发布 Release: $tag"
+          # gh release create 需要 tag 已在远端；本地 git tag 后再 push 太慢，
+          # 直接 --target 指向当前 commit SHA 由 gh 代建远端 tag。
+          echo "创建 Release: $tag (target $GITHUB_SHA)"
           gh release create "$tag" \
             "dist/mj2-chs/MajestyII-CHS-"*.zip \
             "dist/mj2-cht/MajestyII-CHT-"*.zip \
+            --target "$GITHUB_SHA" \
             --title "Majesty II 汉化补丁 $tag" \
             --notes "自动构建 CHS/CHT 汉化补丁。详见仓库 README。"
           echo "✅ 已发布: $tag"
