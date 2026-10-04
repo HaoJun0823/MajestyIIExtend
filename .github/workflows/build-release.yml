@@ -64,7 +64,10 @@ concurrency:
 jobs:
   build:
     name: 构建发布包
-    runs-on: windows-2022
+    # v141_xp 需要 VS2017 工具链：windows-2022/latest 镜像已移除 VS2017，
+    # 现场安装 VC.v141 常超时（实测 10 分钟装不完 → fallback 到 v142 产出错误 DLL）。
+    # windows-2019 镜像自带 VS2019 + VS2017 构建工具，v141 cl.exe 开箱即用。
+    runs-on: windows-2019
     timeout-minutes: 60
 
     env:
@@ -89,51 +92,24 @@ jobs:
           python -m pip install opencc Pillow freetype-py pyyaml fonttools numpy
 
       # ── 确保 v141 (MSVC 14.16) 编译器存在 ─────────────────────────────
-      # cl.exe 直调，但这仍需 v141 工具链本体；镜像没有 → 现场装。
-      # 装的是 `VC.v141.x86.x64`（含 cl.exe + 库）；glm/x86 不在其列，无碍。
-      - name: 安装 v141 工具集（VC.v141.x86.x64）
+      # windows-2019 镜像自带 VS2017 构建工具 → v141 cl.exe 开箱即用，无需现场安装。
+      # 这里只做快速自检，发现缺失立即失败（不再允许 fallback 到 v142：
+      # 那会产出 143872B 的“错误”DLL，正确 v141_xp 产物是 144384B）。
+      - name: 检查 v141 工具集（VC.v141.x86.x64）
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $found = if (Test-Path $vsw) {
-            $p = & $vsw -latest -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null
-            if ($p) { $p | Select-Object -First 1 } else { $null }
+          $p = if (Test-Path $vsw) {
+            & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null |
+              Select-Object -First 1
           } else { $null }
-          if ($found) {
-            Write-Host "已存在 v141 cl.exe: $found"
-          } else {
-            Write-Host "未找到 v141 cl.exe，经 VS Installer 安装 VC.v141.x86.x64 ..."
-            $candidates = @(
-              "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe",
-              "C:\Program Files\Microsoft Visual Studio\Installer\setup.exe"
-            )
-            $setup = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $setup) { throw "找不到 VS Installer setup.exe，无法安装 v141" }
-            # 注意：setup.exe 不支持 --wait（报 Option unknown 且不装）→ 去掉，
-            # 安装异步返回，下面轮询 vswhere 等 v141 真实出现（最多 10 分钟）。
-            & $setup modify --installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" `
-              --add Microsoft.VisualStudio.Component.VC.v141.x86.x64 `
-              --quiet --norestart
-            if ($LASTEXITCODE -ne 0) { Write-Warning "VS Installer 安装 v141 返回 rc=$LASTEXITCODE（异步，下面轮询确认）" }
-            $deadline = (Get-Date).AddMinutes(10)
-            $installed = $null
-            while ((Get-Date) -lt $deadline) {
-              Start-Sleep -Seconds 15
-              $installed = & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null |
-                Select-Object -First 1
-              if ($installed) { break }
-            }
-            if ($installed) {
-              Write-Host "v141 安装完成: $installed"
-            } else {
-              # 装不上 v141 时允许 build_release.ps1 用新版 MSVC (14.29+/v142+) fallback 编译：
-              # cl 直调产物是 32 位无 CRT PE32 DLL，v142 与 v141_xp 行为一致（自实现 memcpy/__chkstk）。
-              Write-Warning "v141 在 10 分钟内未装好；build_release.ps1 将 fallback 到已存在的更新 MSVC 工具集"
-            }
-            # 装到的 BuildTools 实例要在 vswhere 里能被 -all 看到（默认 -latest 可能选不到），
-            # 但我们脚本会先找 BuildTools 实例，再 -all 兜底 → 交给 build_release.ps1 的发现逻辑。
+          if (-not $p) {
+            $legacy = "C:\Program Files (x86)\Microsoft Visual Studio\2017\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe"
+            $p = (Get-ChildItem $legacy -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
           }
+          if (-not $p) { throw "未找到 v141 cl.exe（windows-2019 应自带 VC.v141 组件），无法产出 v141_xp DLL" }
+          Write-Host "v141 cl.exe 就绪: $p"
 
       # ── 核心：装配脚本 ─────────────────────────────────────────────
       # CI 恒用已提交的 fontgen/font_auto_build 成品字库（与 V15 逐字节一致），
