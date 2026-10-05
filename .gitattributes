@@ -61,3 +61,10 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# Binary font assets — must NOT be line-ending normalized by * text=auto
+###############################################################################
+*.dds   binary
+*.tuv   binary
+*.zip   binary
