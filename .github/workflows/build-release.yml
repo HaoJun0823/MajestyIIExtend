@@ -95,25 +95,32 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install opencc Pillow freetype-py pyyaml fonttools numpy
 
-      # ── 确保 v141 (MSVC 14.16) 编译器存在 ─────────────────────────────
-      # windows-2019 镜像自带 VS2017 构建工具 → v141 cl.exe 开箱即用，无需现场安装。
-      # 这里只做快速自检，发现缺失立即失败（不再允许 fallback 到 v142：
-      # 那会产出 143872B 的“错误”DLL，正确 v141_xp 产物是 144384B）。
-      - name: 检查 v141 工具集（VC.v141.x86.x64）
+      # ── 探查镜像上可用的 MSVC 工具集（诊断用，不再因缺失 v141 硬失败）────
+      # windows-2022 镜像默认不带 v141(MSVC 14.16)；最终是否产出正确 v141_xp DLL
+      # 由下方「校验 asi 体积」闸门兜底（非 144384B 直接失败，绝不发错包）。
+      # 这里只打印所有 cl.exe 供排查，并把发现的 v141 cl.exe 写入 $env，供 build 步优先使用。
+      - name: 探查 MSVC 工具集
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $p = if (Test-Path $vsw) {
-            & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null |
-              Select-Object -First 1
-          } else { $null }
-          if (-not $p) {
-            $legacy = "C:\Program Files (x86)\Microsoft Visual Studio\2017\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe"
-            $p = (Get-ChildItem $legacy -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          Write-Host "=== 镜像上所有 cl.exe (Hostx86\x86) ==="
+          if (Test-Path $vsw) {
+            & $vsw -all -products * -find 'VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe' 2>$null | ForEach-Object { Write-Host "  $_" }
           }
-          if (-not $p) { throw "未找到 v141 cl.exe（windows-2022 应自带 VC.v141 组件），无法产出 v141_xp DLL" }
-          Write-Host "v141 cl.exe 就绪: $p"
+          # 也直接扫盘兜底
+          Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.FullName)" }
+          # 记录是否找到 14.16（v141）
+          $v141 = if (Test-Path $vsw) {
+            & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null | Select-Object -First 1
+          } else { $null }
+          if (-not $v141) {
+            $v141 = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($v141) { Write-Host "✓ 发现 v141 cl.exe: $v141" } else { Write-Host "⚠ 镜像未预装 v141(14.16)，将依赖 build_release.ps1 的 fallback 或后续安装" }
+          # 暴露给后续步骤（build_release.ps1 内部也用 vswhere 再发现一次）
+          Add-Content -Path $env:GITHUB_ENV -Value "MJ2_V141_CL=$v141"
 
       # ── 核心：装配脚本 ─────────────────────────────────────────────
       # CI 恒用已提交的 fontgen/font_auto_build 成品字库（与 V15 逐字节一致），
