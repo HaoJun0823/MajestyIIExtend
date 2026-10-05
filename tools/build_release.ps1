@@ -27,6 +27,19 @@ Usage:
 Dependencies:
     - Python 3.10+, pip packages: opencc (s2t), Pillow, freetype-py (bake)
     - Baking is only needed when aggregating from scratch (CI/new clone)
+
+Platform support (2026-10-05):
+    - Windows: local VS2017 (v141 14.16) cl.exe via vswhere — unchanged.
+    - Linux  : CI ubuntu-latest builds via msvc-wine (MSVC v141 14.16 +
+      Win10 SDK 26100 under Wine). STEP 2 auto-detects the platform: on
+      Linux it needs env var MSVC_WINE_PREFIX (msvc-wine install dir, with
+      bin/x86/cl wrapper from install.sh) and invokes the wrapper directly
+      — INCLUDE/LIB are set by the wrapper itself. Flags are item-for-item
+      equivalent to build_deploy.sh/build.bat (cl treats '-' and '/' option
+      prefixes identically; the '-' form avoids the wine wrapper mistaking
+      '/xxx' args for Unix paths).
+    - All path literals in this script use '/': accepted by .NET on Linux
+      AND by the Win32 API layer, so one script serves both platforms.
 ========================================================================
 #>
 [CmdletBinding()]
@@ -73,7 +86,7 @@ foreach ($d in @($OutDir, $Build, $CHS, $CHT)) {
 # ============================================================
 # STEP 1 — font bake (optional; CI / aggregate path)
 # ============================================================
-$script:BakeOut = Join-Path $Repo 'fontgen\font_auto_build'   # aligned with yaml output_dir
+$script:BakeOut = Join-Path $Repo 'fontgen/font_auto_build'   # aligned with yaml output_dir
 if (-not $SkipBake) {
     Invoke-Step "STEP 1 · bake CJK fonts (build_font_atlas.py font_auto_build.yaml)" {
         Push-Location (Join-Path $Repo 'fontgen')
@@ -96,89 +109,118 @@ if (-not $SkipBake) {
 if (-not $SkipDll) {
     Invoke-Step "STEP 2 · compile MajestyII_UTF8.dll (cl.exe direct)" {
         $slnDir = Join-Path $Repo 'MajestyII_UTF8'
-        # --- discover cl.exe (prefer v141, any MSVC toolset as fallback) ---
-        # cl.exe lives at <ver>/bin/Hostx86/x86/cl.exe; v141 version dirs are 14.16*
-        $cl = $null
-        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        if (Test-Path $vswhere) {
-            foreach ($q in @('VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe','VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe')) {
-                $hit = (& $vswhere -all -products * -find $q 2>$null | Select-Object -First 1)
-                if ($hit) { $cl = $hit; break }
-            }
-        }
-        if (-not $cl) {
-            $legacy = "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\VC\Tools\MSVC\14.16.27023\bin\Hostx86\x86\cl.exe"
-            if (Test-Path $legacy) { $cl = $legacy }
-        }
-        if (-not $cl) { throw "cl.exe not found. CI must install v141 toolset (VS Installer VC.v141.x86.x64)." }
-        Write-Host "cl.exe = $cl"
-
-        # --- MSVC version root <ver> (4 levels up from cl.exe) ---
-        #   cl.exe -> x86 -> Hostx86 -> bin -> <ver>
-        $ver = Split-Path (Split-Path (Split-Path (Split-Path $cl -Parent) -Parent) -Parent) -Parent
-
-        # --- SDK: highest Windows Kits\10\Include with um/shared/ucrt ---
-        $kitsRoot  = "${env:ProgramFiles(x86)}\Windows Kits\10"
-        $sdkInc = Get-ChildItem (Join-Path $kitsRoot 'Include') -Directory -ErrorAction SilentlyContinue |
-                  Where-Object { (Test-Path (Join-Path $_.FullName 'um')) -and (Test-Path (Join-Path $_.FullName 'shared')) -and (Test-Path (Join-Path $_.FullName 'ucrt')) } |
-                  Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending | Select-Object -First 1
-        if (-not $sdkInc) { throw "Windows SDK not found under $kitsRoot\Include (need um/shared/ucrt)" }
-        $sdkVer = $sdkInc.Name
-        Write-Host "SDK = $sdkVer"
-
-        # --- INCLUDE / LIB (MSVC <ver> + SDK) ---
-        $env:INCLUDE = @(
-            (Join-Path $ver 'include'),
-            (Join-Path $kitsRoot "Include\$sdkVer\ucrt"),
-            (Join-Path $kitsRoot "Include\$sdkVer\um"),
-            (Join-Path $kitsRoot "Include\$sdkVer\shared")
-        ) -join ';'
-        $env:LIB = @(
-            (Join-Path $ver 'lib\x86'),
-            (Join-Path $kitsRoot "Lib\$sdkVer\ucrt\x86"),
-            (Join-Path $kitsRoot "Lib\$sdkVer\um\x86")
-        ) -join ';'
-        Write-Host "MSVC ver = $ver"
-        Write-Host "INCLUDE = $env:INCLUDE"
-        Write-Host "LIB     = $env:LIB"
-
-        # --- compile: same flags as build_deploy.sh/build.bat ---
-        # Use a cmd driver to avoid pwsh parsing ambiguity on /link & quoted /OUT.
         $dll = Join-Path $slnDir 'MajestyII_UTF8.dll'
         Push-Location $slnDir
         try {
-            $driver = @"
+            if ($IsLinux -or $IsMacOS) {
+                # ---- Linux / msvc-wine（CI ubuntu-latest 路线）-------------------
+                # wrapper 是 install.sh 生成的 shell 脚本，内部经 wine 调真 cl.exe
+                # （Hostx64/x86：64 位宿主编 32 位目标），INCLUDE/LIB 由 wrapper
+                # 内部的 msvcenv.sh 设置 —— 这里不用、也不该再设这两个环境变量。
+                $prefix = $env:MSVC_WINE_PREFIX
+                if (-not $prefix) { throw "Linux build needs env MSVC_WINE_PREFIX (msvc-wine install dir)" }
+                $cl = Join-Path $prefix 'bin/x86/cl'
+                if (-not (Test-Path $cl)) { throw "msvc-wine cl wrapper not found: $cl (did install.sh run?)" }
+                Write-Host "cl (msvc-wine) = $cl"
+
+                # ★ flags 与 build_deploy.sh / build.bat 逐项等价：cl 对 '-' 与 '/'
+                #   前缀一视同仁；wine 路线统一用 '-' 形式，避免 '/xxx' 被包装层
+                #   当成 Unix 绝对路径处理。数组 splatting 杜绝 pwsh 参数解析歧义。
+                $clArgs = @(
+                    '-nologo','-LD','-EHsc','-Y-','-utf-8','-O2',
+                    '-D','WIN32','-D','NDEBUG','-D','MAJESTYIIUTF8_EXPORTS',
+                    '-D','_WINDOWS','-D','_USRDLL',
+                    '-I.','dllmain.cpp','pch.cpp',
+                    '-link','-OUT:MajestyII_UTF8.dll','-SUBSYSTEM:WINDOWS',
+                    'kernel32.lib','user32.lib','gdi32.lib','winmm.lib',
+                    'advapi32.lib','shell32.lib','ole32.lib'
+                )
+                Write-Host ("cl args: " + ($clArgs -join ' '))
+                & $cl @clArgs
+                if ($LASTEXITCODE -ne 0) { throw "cl compile failed (rc=$LASTEXITCODE)" }
+            } else {
+                # ---- Windows（本地 VS2017 路线，原样保留）-------------------------
+                # --- discover cl.exe (prefer v141, any MSVC toolset as fallback) ---
+                # cl.exe lives at <ver>/bin/Hostx86/x86/cl.exe; v141 version dirs are 14.16*
+                $cl = $null
+                $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+                if (Test-Path $vswhere) {
+                    foreach ($q in @('VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe','VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe')) {
+                        $hit = (& $vswhere -all -products * -find $q 2>$null | Select-Object -First 1)
+                        if ($hit) { $cl = $hit; break }
+                    }
+                }
+                if (-not $cl) {
+                    $legacy = "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\VC\Tools\MSVC\14.16.27023\bin\Hostx86\x86\cl.exe"
+                    if (Test-Path $legacy) { $cl = $legacy }
+                }
+                if (-not $cl) { throw "cl.exe not found. CI must install v141 toolset (VS Installer VC.v141.x86.x64)." }
+                Write-Host "cl.exe = $cl"
+
+                # --- MSVC version root <ver> (4 levels up from cl.exe) ---
+                #   cl.exe -> x86 -> Hostx86 -> bin -> <ver>
+                $ver = Split-Path (Split-Path (Split-Path (Split-Path $cl -Parent) -Parent) -Parent) -Parent
+
+                # --- SDK: highest Windows Kits\10\Include with um/shared/ucrt ---
+                $kitsRoot  = "${env:ProgramFiles(x86)}\Windows Kits\10"
+                $sdkInc = Get-ChildItem (Join-Path $kitsRoot 'Include') -Directory -ErrorAction SilentlyContinue |
+                          Where-Object { (Test-Path (Join-Path $_.FullName 'um')) -and (Test-Path (Join-Path $_.FullName 'shared')) -and (Test-Path (Join-Path $_.FullName 'ucrt')) } |
+                          Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending | Select-Object -First 1
+                if (-not $sdkInc) { throw "Windows SDK not found under $kitsRoot\Include (need um/shared/ucrt)" }
+                $sdkVer = $sdkInc.Name
+                Write-Host "SDK = $sdkVer"
+
+                # --- INCLUDE / LIB (MSVC <ver> + SDK) ---
+                $env:INCLUDE = @(
+                    (Join-Path $ver 'include'),
+                    (Join-Path $kitsRoot "Include\$sdkVer\ucrt"),
+                    (Join-Path $kitsRoot "Include\$sdkVer\um"),
+                    (Join-Path $kitsRoot "Include\$sdkVer\shared")
+                ) -join ';'
+                $env:LIB = @(
+                    (Join-Path $ver 'lib\x86'),
+                    (Join-Path $kitsRoot "Lib\$sdkVer\ucrt\x86"),
+                    (Join-Path $kitsRoot "Lib\$sdkVer\um\x86")
+                ) -join ';'
+                Write-Host "MSVC ver = $ver"
+                Write-Host "INCLUDE = $env:INCLUDE"
+                Write-Host "LIB     = $env:LIB"
+
+                # --- compile: same flags as build_deploy.sh/build.bat ---
+                # Use a cmd driver to avoid pwsh parsing ambiguity on /link & quoted /OUT.
+                $driver = @"
 @echo off
 setlocal
 chcp 65001 >nul
 "$cl" /nologo /LD /EHsc /Y- /utf-8 /O2 /D WIN32 /D NDEBUG /D MAJESTYIIUTF8_EXPORTS /D _WINDOWS /D _USRDLL /I. dllmain.cpp pch.cpp /link /OUT:"MajestyII_UTF8.dll" /SUBSYSTEM:WINDOWS kernel32.lib user32.lib gdi32.lib winmm.lib advapi32.lib shell32.lib ole32.lib
 exit /b %errorlevel%
 "@
-            $bat = Join-Path $slnDir "_build_release_driver.cmd"
-            [System.IO.File]::WriteAllText($bat, $driver, [System.Text.Encoding]::ASCII)
-            cmd /c "`"$bat`""
-            Remove-Item $bat -Force -ErrorAction SilentlyContinue
-            if ($LASTEXITCODE -ne 0) { throw "cl.exe compile failed (rc=$LASTEXITCODE)" }
+                $bat = Join-Path $slnDir "_build_release_driver.cmd"
+                [System.IO.File]::WriteAllText($bat, $driver, [System.Text.Encoding]::ASCII)
+                cmd /c "`"$bat`""
+                Remove-Item $bat -Force -ErrorAction SilentlyContinue
+                if ($LASTEXITCODE -ne 0) { throw "cl.exe compile failed (rc=$LASTEXITCODE)" }
+            }
         } finally { Pop-Location }
 
         if (-not (Test-Path $dll)) { throw "compile did not produce $dll" }
         # --- deploy as asi to CHS/CHT update/ ---
         foreach ($dst in @(
-            (Join-Path $CHS 'update\MajestyII_GB18030_2000.asi'),
-            (Join-Path $CHT 'update\MajestyII_GB18030_2000.asi'))) {
+            (Join-Path $CHS 'update/MajestyII_GB18030_2000.asi'),
+            (Join-Path $CHT 'update/MajestyII_GB18030_2000.asi'))) {
             New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
             Copy-Item $dll $dst -Force
         }
-        Write-Host "asi deployed -> CHS\update & CHT\update"
+        Write-Host "asi deployed -> CHS/update & CHT/update"
     }
 } else {
     Write-Host ">> skip DLL compile (-SkipDll), reusing committed asi"
     # 手动 dispatch 设置 skip_dll=true 时走此分支：复用已提交的 dist/MajestyII_GB18030_2000.asi
     # （v141_xp 144384B，与 V15 逐字节一致，仅 PE 时间戳不同）；其次回退到 gitignore 的本地 dll。
-    $committedAsi = Join-Path $Repo 'dist\MajestyII_GB18030_2000.asi'
-    $srcDll = if (Test-Path $committedAsi) { $committedAsi } else { Join-Path $Repo 'MajestyII_UTF8\MajestyII_UTF8.dll' }
+    $committedAsi = Join-Path $Repo 'dist/MajestyII_GB18030_2000.asi'
+    $srcDll = if (Test-Path $committedAsi) { $committedAsi } else { Join-Path $Repo 'MajestyII_UTF8/MajestyII_UTF8.dll' }
     if (Test-Path $srcDll) {
-        foreach ($dst in @((Join-Path $CHS 'update\MajestyII_GB18030_2000.asi'),(Join-Path $CHT 'update\MajestyII_GB18030_2000.asi'))) {
+        foreach ($dst in @((Join-Path $CHS 'update/MajestyII_GB18030_2000.asi'),(Join-Path $CHT 'update/MajestyII_GB18030_2000.asi'))) {
             New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
             Copy-Item $srcDll $dst -Force
         }
@@ -193,7 +235,7 @@ exit /b %errorlevel%
 # ============================================================
 function Convert-File-S2T([string]$src, [string]$dst, [string]$encoding) {
     # src/dst both GB18030; python opencc converts only CJK, keeps ASCII/tags/structure
-    $tmp = Join-Path $env:TEMP ("mj2_{0}.py" -f ([guid]::NewGuid().ToString('N')))
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("mj2_{0}.py" -f ([guid]::NewGuid().ToString('N')))
     $py = @'
 import sys
 from opencc import OpenCC
@@ -220,9 +262,9 @@ if (-not $SkipOpenCC) {
         if ($LASTEXITCODE) { throw "missing opencc; pip install opencc" }
 
         # traditional dict
-        $dictSrc = Join-Path $Repo 'Text\DictRead.txt'
+        $dictSrc = Join-Path $Repo 'Text/DictRead.txt'
         if (Test-Path $dictSrc) {
-            $dictDst = Join-Path $CHT 'update\DictRead.txt'
+            $dictDst = Join-Path $CHT 'update/DictRead.txt'
             New-Item -ItemType Directory -Force -Path (Split-Path $dictDst -Parent) | Out-Null
             Convert-File-S2T $dictSrc $dictDst 'GB18030'
         } else { Write-Warning "missing $dictSrc; skipping traditional dict" }
@@ -277,7 +319,7 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         $ud = Join-Path $target 'update'
         New-Item -ItemType Directory -Force -Path $ud | Out-Null
         if ($lang -eq 'CHS') {
-            $ds = Join-Path $Repo 'Text\DictRead.txt'
+            $ds = Join-Path $Repo 'Text/DictRead.txt'
             if (Test-Path $ds) {
                 # CI checkout (`* text=auto` + core.autocrlf=true) turns DictRead into
                 # CRLF; strip every CR so the shipped dict stays LF (841910B) like the
@@ -295,8 +337,8 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         # 4.5 merge Resource into update/localization/**  (lang overrides Common)
         # 4.5a localization\texts\texts.zip  =  Common meta (5) + lang logo (2 files + dirs)
         #                                     + committed bake fonts (27) in V15 order (36 entries)
-        $resCommon = Join-Path $Repo 'Resource\Common'
-        $resLang   = Join-Path $Repo "Resource\$lang"
+        $resCommon = Join-Path $Repo 'Resource/Common'
+        $resLang   = Join-Path $Repo "Resource/$lang"
         # ZipArchiveMode lives in System.IO.Compression; ZipFile in
         # System.IO.Compression.FileSystem — load BOTH before the helpers below
         # reference the types (PS7/.NET Core keeps them in separate assemblies).
@@ -336,21 +378,21 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         }
 
         # -- 4.5a1 texts.zip: 36 entries in exact V15 order --
-        $textsZip = Join-Path $ud 'localization\texts\texts.zip'
+        $textsZip = Join-Path $ud 'localization/texts/texts.zip'
         New-Item -ItemType Directory -Force -Path (Split-Path $textsZip -Parent) | Out-Null
         if (Test-Path $textsZip) { Remove-Item $textsZip -Force }
         $tz = [System.IO.Compression.ZipFile]::Open($textsZip, [System.IO.Compression.ZipArchiveMode]::Create)
         try {
             $script:zipSeen = New-Object 'System.Collections.Generic.HashSet[string]'
             # meta from Common tree (V15-identical, verified)
-            $metaDir = Join-Path $resCommon 'localization\texts\text.zip'
+            $metaDir = Join-Path $resCommon 'localization/texts/text.zip'
             # logo from lang tree
-            $logoDir = Join-Path $resLang 'localization\texts\texts.zip'
+            $logoDir = Join-Path $resLang 'localization/texts/texts.zip'
             # fonts from committed bake output (byte-identical to V15)
             $fontsDir = $script:BakeOut
 
-            $logo = Join-Path $logoDir 'enGUIne\Textures\gui_game_logo.dds'
-            $splash = Join-Path $metaDir 'enGUIne\Textures\splashscreen.bmp'
+            $logo = Join-Path $logoDir 'enGUIne/Textures/gui_game_logo.dds'
+            $splash = Join-Path $metaDir 'enGUIne/Textures/splashscreen.bmp'
             if (-not (Test-Path $logo)) { throw "missing logo $logo" }
             if (-not (Test-Path $splash)) { throw "missing splashscreen $splash" }
 
@@ -388,15 +430,15 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
 
         # -- 4.5a2 expansion_1..5 zips: Common markers/metadata + lang logo, V15 order --
         foreach ($n in 1..5) {
-            $expZip = Join-Path $ud "localization.expansion_$n\texts\texts.expansion_$n.zip"
+            $expZip = Join-Path $ud "localization.expansion_$n/texts/texts.expansion_$n.zip"
             New-Item -ItemType Directory -Force -Path (Split-Path $expZip -Parent) | Out-Null
             if (Test-Path $expZip) { Remove-Item $expZip -Force }
             $ez = [System.IO.Compression.ZipFile]::Open($expZip, [System.IO.Compression.ZipArchiveMode]::Create)
             try {
                 $script:zipSeen = New-Object 'System.Collections.Generic.HashSet[string]'
-                $cExp = Join-Path $resCommon "localization.expansion_$n\texts\texts.expansion_$n.zip"
-                $lExp = Join-Path $resLang "localization.expansion_$n\texts\texts.expansion_$n.zip"
-                $cLogo = Join-Path $lExp 'enGUIne\Textures\gui_game_logo.dds'
+                $cExp = Join-Path $resCommon "localization.expansion_$n/texts/texts.expansion_$n.zip"
+                $lExp = Join-Path $resLang "localization.expansion_$n/texts/texts.expansion_$n.zip"
+                $cLogo = Join-Path $lExp 'enGUIne/Textures/gui_game_logo.dds'
                 if (-not (Test-Path $cLogo)) { throw "missing expansion_$n logo $cLogo" }
                 Add-ZipDirEntries $ez 'enGUIne/'
                 Add-ZipDirEntries $ez 'enGUIne/Textures/'
@@ -425,12 +467,12 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         }
 
         # 4.5b update/localization/launcher
-        $lL = Join-Path $resLang "localization\launcher"
-        $lC = Join-Path $resCommon "localization\launcher"
+        $lL = Join-Path $resLang "localization/launcher"
+        $lC = Join-Path $resCommon "localization/launcher"
         $lSrc = if (Test-Path $lL) { $lL } elseif (Test-Path $lC) { $lC } else { $null }
         if ($lSrc) {
             Get-ChildItem $lSrc -File -ErrorAction SilentlyContinue | ForEach-Object {
-                $dstL = Join-Path $ud "localization\launcher\$($_.Name)"
+                $dstL = Join-Path $ud "localization/launcher/$($_.Name)"
                 New-Item -ItemType Directory -Force -Path (Split-Path $dstL -Parent) | Out-Null
                 Copy-Item $_.FullName $dstL -Force
             }
@@ -444,7 +486,7 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         if (Test-Path $sup) {
             Get-ChildItem $sup -File -Recurse | ForEach-Object {
                 $rel = $_.FullName.Substring($sup.Length + 1)
-                $dstS = Join-Path $target "support\$rel"
+                $dstS = Join-Path $target "support/$rel"
                 New-Item -ItemType Directory -Force -Path (Split-Path $dstS -Parent) | Out-Null
                 Copy-Item $_.FullName $dstS -Force
             }
@@ -463,7 +505,7 @@ Invoke-Step "STEP 5 · verify artifacts" {
     foreach ($lang in @('CHS','CHT')) {
         $t = if ($lang -eq 'CHS') { $CHS } else { $CHT }
         $errs = @()
-        $asi = Join-Path $t "update\MajestyII_GB18030_2000.asi"
+        $asi = Join-Path $t "update/MajestyII_GB18030_2000.asi"
         if (-not (Test-Path $asi)) { $errs += "missing $asi" }
         else {
             $b = [System.IO.File]::ReadAllBytes($asi)
@@ -474,7 +516,7 @@ Invoke-Step "STEP 5 · verify artifacts" {
                 if ($machine -ne 0x014c) { $errs += "asi machine=0x{0:x} not x86/PE32" -f $machine }
             }
         }
-        $tz = Join-Path $t "update\localization\texts\texts.zip"
+        $tz = Join-Path $t "update/localization/texts/texts.zip"
         if (-not (Test-Path $tz)) { $errs += "missing texts.zip file" }
         else {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -484,7 +526,7 @@ Invoke-Step "STEP 5 · verify artifacts" {
                 if ($cdds.Count -lt 4) { $errs += "CJK _c.dds insufficient inside texts.zip (want >=4): got $($cdds.Count)" }
             } finally { $z.Dispose() }
         }
-        if (-not (Test-Path (Join-Path $t "update\DictRead.txt"))) { $errs += "missing update\DictRead.txt" }
+        if (-not (Test-Path (Join-Path $t "update/DictRead.txt"))) { $errs += "missing update/DictRead.txt" }
         foreach ($e in $errs) { Write-Host "  X $e" }
         if ($errs.Count) { throw ("{0} package verification failed: {1} issue(s)" -f $lang, $errs.Count) }
         Write-Host "  OK $lang verification passed"

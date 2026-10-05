@@ -29,8 +29,12 @@ SRC: "original_dds"
 output_dir: "out_fromscratch"
 charlist_source: "dll"                         # 贴图顺序直接由 DLL 的 g_charlist_data[] 派生（权威、不可错位）
 dll_cpp: "../MajestyII_UTF8/dllmain.cpp"      # 仅 charlist_source=dll 时使用
-charlist_file: "charlist_full_gb18030.txt"     # dll 缺失时的回退源（GB18030 序）
-atlas_width: 4096          # 画布基准宽（自动模式会按需放大到 2 的幂）
+charlist_file: "DictRead_V14_GB18030.txt"     # dll 缺失时的回退源（GB18030 序）
+# 字符过滤（可选 · 大幅压缩贴图）：提供游戏实际出现文字的 GB18030 txt，
+# 则只渲染其中的汉字，其余汉字 TUV 写 0 0 0 0、DDS 只打包有效字形。
+# 开启后下方 atlas_width/atlas_height 的 4096 固定值会被忽略，改为从 1024 起自适应。
+# used_chars_txt: "all_game_text_gb18030.txt"
+atlas_width: 4096          # 画布基准宽（自动模式会按需放大到 2 的幂；过滤模式忽略此项）
 atlas_height: 4096
 output_format: "dxt5"      # dxt5(默认,BC3) | bgra(32位无损)
 padding: 1

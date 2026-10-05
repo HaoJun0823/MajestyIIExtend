@@ -1,7 +1,7 @@
 name: build-release
 
 # ============================================================================
-# MajestyIIExtend 汉化补丁构建 + 自动发 Release
+# MajestyIIExtend 汉化补丁构建 + 自动发 Release（ubuntu-latest + msvc-wine 版）
 # ----------------------------------------------------------------------------
 # 产物（CHS / CHT 两个独立 zip，均可直接解压到游戏根目录）：
 #   MajestyII-CHS-{date}-{time}.zip
@@ -12,21 +12,31 @@ name: build-release
 #                            随后 publish job 在**同一 run** 内按日期-时间打 tag
 #                            并发 Release（两个 ASCII 名 zip 附件），无需手动打 tag。
 #   pull_request          —— 构建 + 校验（门禁，不发布）
-#   workflow_dispatch     —— 手动；可勾选跳过烘焙 / 跳过 DLL 编译
+#   workflow_dispatch     —— 手动；可勾选跳过 DLL 编译（烘焙恒跳过，见下）
 #
-# ★ 编译路线 = cl.exe 直调（v141_xp，32 位 DLL），不是 MSBuild：
-#   - 完全复刻 build_deploy.sh / build.bat 的 flags，产出无 CRTer
-#   - 不依赖 NuGet restore（dllmain.cpp 不用 MinHook），也不需要 Windows SDK
-#     7.1A（那是 v141_xp 在 MSBuild 里才强制的坑）
-#   - windows-2022（= windows-latest，VS2022）镜像已自带 v141(MSVC 14.16) 工具集，
-#     直接 vswhere 动态发现 cl.exe 即可，无需现场安装（参考 cnc-ddraw 在 windows-latest
-#     直编 v141_xp，其 WinXP 组件安装步骤已注释掉 = 镜像自带）。windows-2019 已于
-#     2025 年前后下架，故不能用。
+# ★★ 2026-10-05 架构切换：windows-latest → ubuntu-latest + msvc-wine。
+#   背景：windows-2022/2025 镜像**均不带 v141 (MSVC 14.16)**（原工作流假设
+#   「镜像自带 v141」已被 SR_GAME_CHINESE 项目的 CI 实测证伪），build_release.ps1
+#   会静默回退 v142，产出 143872B 的错误 asi 被体积闸门拦下 → CI 挂。
+#   修复方式与 SR_GAME_CHINESE 同款（已在该仓库实测通过）：
+#     · msvc-wine (github.com/mstorsjo/msvc-wine) 用与 VS 安装器同一份官方
+#       manifest 从微软 CDN 拉包，wine 运行真 cl.exe/link.exe；
+#     · 「v141_xp 32 位 DLL」在本项目的实际配方 = 14.16 (v141) cl.exe 直调 +
+#       build_deploy.sh/build.bat 的那组 flags（无 XP 专属选项、无 MinHook、
+#       无 NuGet），msvc-wine 拿到的 VC.Tools.14.16 与之完全匹配；
+#     · ★ SDK 必须是 **10.0.26100**：144384B 这个体积指纹是「14.16 + 这组
+#       flags + Win10 SDK 26100」的确定产物（build_deploy.sh 与旧 windows CI
+#       均用 26100）。VS2017 manifest（--major 15）里没有 26100，故**分两段**
+#       下载：VC 14.16 走 VS2017 channel（--with-sdk=no），SDK 26100 走
+#       VS2022 channel（--sdk-version 10.0.26100），再 mv 合并进同一 prefix。
+#       install.sh 探测 SDKVER 时只有 26100 一个，自动选中。
+#     · build_release.ps1 已跨平台化：Linux 分支用 bin/x86/cl wrapper
+#       （Hostx64/x86，64 位宿主编 32 位目标），INCLUDE/LIB 由 wrapper 设置。
 #
-# ★ 字体烘焙（from_scratch）需要把以下文件提交进 git（.gitignore 已放行）：
-#   fontgen/*.ttf、fontgen/original_dds/、fontgen/texconv.exe、
-#   fontgen/DictRead_V14_GB18030.txt
-#   这些不在就无法烘焙字库，release 会缺字库。
+# ★ 字体烘焙（from_scratch）在 CI 恒跳过（-SkipBake）：
+#   从零烘焙需 texconv.exe（Windows 程序，linux 不可跑），且曾在 CI 产出
+#   4096 尺寸错误字库（V15 判错）。烘焙仍在本地做，成品提交于
+#   fontgen/font_auto_build/（与 V15 逐字节一致）。
 # ============================================================================
 
 on:
@@ -46,12 +56,8 @@ on:
       - '.workbuddy/**'
   workflow_dispatch:
     inputs:
-      skip_bake:
-        description: '跳过字体烘焙（默认 false：正常 CI 不烘焙，直接复用已提交的 fontgen/font_auto_build 成品字库 —— 该字库已与 V15 逐字节一致）'
-        type: boolean
-        default: false
       skip_dll:
-        description: '跳过 DLL 编译（仅重建资源包，需已有 dll 产物 —— CI 上不要勾）'
+        description: '跳过 DLL 编译（复用已提交 dist/ 成品 asi —— CI 上一般不要勾）'
         type: boolean
         default: false
 
@@ -65,96 +71,187 @@ concurrency:
 
 jobs:
   build:
-    name: 构建发布包
-    # 用户要求：用 windows-latest 直接从源码编译 v141_xp（不要 windows-2022 特例，
-    # 也不要提交成品 asi）。v141(MSVC 14.16) 需镜像自带；下方「探查 MSVC 工具集」
-    # 打印所有 cl.exe 取证，「校验 asi 体积」闸门（非 144384B 即失败）兜底，
-    # 即使 windows-latest 无 v141 也只会构建失败、绝不会发错包。
-    runs-on: windows-latest
+    name: 构建发布包（ubuntu-latest + msvc-wine MSVC v141 x86）
+    runs-on: ubuntu-latest
     timeout-minutes: 60
 
     env:
       # 本仓库所有 .py 都与中文交互；CI 上强制 UTF-8，避免 UnicodeEncodeError
       PYTHONUTF8: '1'
       PYTHONIOENCODING: 'utf-8'
+      # msvc-wine 安装目录（VC 14.16 + 合并进来的 SDK 26100）。
+      # build_release.ps1 的 Linux 分支读它定位 bin/x86/cl wrapper。
+      MSVC_WINE_PREFIX: ${{ github.workspace }}/.msvc
+      # SDK 26100 的独立下载目录（下载后 mv 合并进 MSVC_WINE_PREFIX）
+      MSVC_SDK_DIR: ${{ github.workspace }}/.msvc-sdk
+      # msvc-wine 上游 checkout 的 ref。升级时改这里 —— cache key 含它。
+      MSVCWINE_REF: master
 
     steps:
       - name: 检出仓库
         uses: actions/checkout@v5
 
-      # ── 环境准备 ─────────────────────────────────────────────────────
+      # ★ 必须完整 checkout msvc-wine（不能只下 vsdownload.py）：
+      #   install.sh 要用仓库里的 lowercase / fixinclude（大小写修复，Linux
+      #   大小写敏感文件系统必需）、wrappers/（cl/link 包装脚本）、
+      #   msvctricks.cpp（自举编译一次 cl 实测可用性）。
+      - name: 检出 msvc-wine
+        uses: actions/checkout@v5
+        with:
+          repository: mstorsjo/msvc-wine
+          ref: ${{ env.MSVCWINE_REF }}
+          path: .msvc-wine
+
       - name: 配置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装 Python 依赖
-        shell: pwsh
+      # CI 恒 -SkipBake（烘焙只在本地做，见文件头注释），OpenCC 是 STEP 3
+      # 简繁转换所需；烘焙依赖（Pillow/freetype-py/numpy/fonttools）不需要。
+      - name: 安装 Python 依赖（opencc）
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install opencc Pillow freetype-py pyyaml fonttools numpy
+          set -euo pipefail
+          python -m pip install --quiet opencc
 
-      # ── 探查镜像上可用的 MSVC 工具集（取证用，非致命）─────────────────
-      # 打印所有 cl.exe，确认 windows-latest 是否真带 v141(14.16)。
-      - name: 探查 MSVC 工具集
-        if: ${{ !cancelled() }}
-        shell: pwsh
+      # ── wine 侧依赖（msvc-wine README 的 Prerequisites）──────────────
+      #   wine64     : 运行真 cl.exe/link.exe（Hostx64 宿主，64 位进程）
+      #   msitools   : msiextract，解 VS 组件与 WinSDK 的 .msi
+      #   winbind    : cl 用 /Zi 时 mspdbsrv 通信需要；本构建无 /Zi，纯保险
+      - name: 安装 wine / msitools 等依赖
         run: |
-          $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          Write-Host "=== 镜像上所有 cl.exe (Hostx86\x86) ==="
-          if (Test-Path $vsw) {
-            & $vsw -all -products * -find 'VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe' 2>$null | ForEach-Object { Write-Host "  $_" }
-          }
-          Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "  $($_.FullName)" }
-          $v141 = if (Test-Path $vsw) { & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null | Select-Object -First 1 } else { $null }
-          if (-not $v141) { $v141 = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 }
-          if ($v141) { Write-Host "✓ 发现 v141 cl.exe: $v141" } else { Write-Host "⚠ 镜像未预装 v141(14.16)，build_release.ps1 将回退 v142 并被体积闸门拦截" }
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y wine64 msitools ca-certificates winbind
+          wine --version
 
-      # ── 核心：装配脚本 ─────────────────────────────────────────────
-      # CI 恒用已提交的 fontgen/font_auto_build 成品字库（与 V15 逐字节一致），
-      # 不现场重烘焙 —— 从零烘焙在 CI 上会产出 4096 尺寸的错误字库（已被 V15 判定为错）。
-      # DLL 从源码直编（cl.exe），由 v141 cl.exe 产出 144384B 正确 asi。
+      # ── 工具链缓存（VC 14.16 + SDK 26100 合并后约 4GB，压缩后可缓存）──
+      - name: 还原 MSVC 工具链缓存
+        uses: actions/cache@v6
+        with:
+          path: .msvc
+          key: mj2-msvcwine-v141-x86-sdk26100-${{ env.MSVCWINE_REF }}-v1
+
+      # ── 下载工具链（缓存未命中时）：两段 vsdownload + 合并 ──────────
+      #   ★ 段 1（VC 14.16）：--major 15 是**关键** —— Microsoft.VisualStudio.
+      #     Component.VC.Tools.14.16（v141）只存在于 VS2017 manifest；VS2022+
+      #     清单里 v141 兼容组件 ID 不同（VC.v141.x86.x64），vsdownload 找
+      #     不到会**静默回退最新工具集**（v143 之类），故必须锁 15。
+      #     --with-sdk=no：SDK 走段 2，这里不装 17763，省 ~500MB。
+      #   ★ 段 2（SDK 26100）：保 144384B 体积指纹的必要条件。VS2022
+      #     manifest 里按 --sdk-version 10.0.26100 精确选中；
+      #     --with-default=no 防止把整个 VCTools workload 连带拉下来。
+      #     vsdownload.py 内部对 17.14 的默认 SDK 恰是 10.0.26100，匹配逻辑
+      #     是 msvc-wine 官方维护的路径；若上游 ID 变化，此步会打印
+      #     "Available versions" 列表，按日志改版本号即可。
+      #   ★ 合并：mv .msvc-sdk/Windows\ Kits -> .msvc/（VC 段没装 SDK，
+      #     该位置是空的，直接 mv）。install.sh 探测 SDKVER 时 26100 是
+      #     唯一版本，自动选中。
+      - name: 下载并装配 MSVC v141 + Win10 SDK 26100（缓存未命中时）
+        run: |
+          set -euo pipefail
+          if [ -x "${MSVC_WINE_PREFIX}/bin/x86/cl" ] && [ -d "${MSVC_WINE_PREFIX}/kits/10/include/10.0.26100.0" ]; then
+            echo "工具链缓存命中（VC 14.16 + SDK 26100），跳过下载。"
+          else
+            echo "==> [1/3] 下载 VC 14.16 (v141, VS2017 channel)"
+            python3 .msvc-wine/vsdownload.py \
+              --accept-license --major 15 --msvc-version 15.9 \
+              --architecture x86 --host-arch x64 \
+              --with-sdk=no --with-atl=no --with-asan=no --with-dia=no \
+              --with-msbuild=no --with-devcmd=no \
+              --dest "${MSVC_WINE_PREFIX}"
+
+            echo "==> [2/3] 下载 Win10 SDK 26100 (VS2022 channel)"
+            python3 .msvc-wine/vsdownload.py \
+              --accept-license --major 17 \
+              --sdk-version 10.0.26100 \
+              --with-default=no \
+              --architecture x86 --host-arch x64 \
+              --dest "${MSVC_SDK_DIR}"
+
+            echo "==> [3/3] 合并 SDK 26100 进 MSVC prefix"
+            if [ -d "${MSVC_WINE_PREFIX}/Windows Kits" ]; then
+              echo "!! .msvc/Windows Kits 已存在，意外状态" >&2; exit 1
+            fi
+            mv "${MSVC_SDK_DIR}/Windows Kits" "${MSVC_WINE_PREFIX}/"
+          fi
+          rm -rf "${MSVC_SDK_DIR}"
+
+      # ── install.sh：大小写修复 + 包装脚本生成（幂等，永远跑）────────
+      #   a) VC/WindowsKits 小写 symlink 化（Linux 大小写敏感必需）；
+      #   b) 生成 bin/x86/{cl,link,...} 包装脚本 + msvcenv.sh（自动探测
+      #      MSVCVER=14.16.x 与 SDKVER=10.0.26100.0）；
+      #   c) wineboot 初始化 prefix；d) 自举编译 msvctricks.cpp 实测 cl。
+      - name: install.sh（生成包装脚本 / 大小写修复）
+        run: |
+          set -euo pipefail
+          sh .msvc-wine/install.sh "${MSVC_WINE_PREFIX}"
+
+      # ── 编译器验证（门禁 + 诊断）──────────────────────────────────
+      #   bin/x86 的 wrapper 内部是 Hostx64/x86 cl.exe（64 位宿主编 32 位
+      #   目标），banner 形如 "... Version 19.16.x for x86"。**必须**看到
+      #   19.16 才放行 —— 防止 vsdownload 参数被上游改动后静默回退新版
+      #   工具集（那会产出 143872B 错误 asi，被下方体积闸门拦截）。
+      - name: 验证编译器为 MSVC v141 x86（诊断 + 门禁）
+        run: |
+          set -euo pipefail
+          export PATH="${MSVC_WINE_PREFIX}/bin/x86:$PATH"
+          banner="$(cl 2>&1 || true)"
+          echo "── cl banner ──"
+          echo "$banner" | head -2
+          if ! echo "$banner" | grep -q "19\.16"; then
+            echo "!! cl 不是 MSVC 14.16 (v141) —— vsdownload 可能回退了版本" >&2
+            exit 1
+          fi
+          echo "── Win SDK 版本（应只有 10.0.26100.0）──"
+          ls "${MSVC_WINE_PREFIX}/kits/10/include/"
+          echo "── 磁盘余量 ──"
+          df -h .
+
+      # ── 核心：装配脚本（pwsh 跨平台跑 build_release.ps1）───────────
+      # Linux 分支自动启用（MSVC_WINE_PREFIX 已在 job env 设置）。
+      # ★ CI 恒 -SkipBake：烘焙不可在 linux 上跑（texconv.exe），且从零烘焙
+      #   曾产出 4096 尺寸错误字库 —— 成品字库已提交，直接复用。
+      # ★ hashtable splatting 而非字符串数组：@('-SkipBake') 展开时
+      #   '-SkipBake' 会被当位置参数（switch 不生效）；@{SkipBake=$true}
+      #   才能让 [switch] 正确生效。
       - name: 运行 build_release.ps1
         shell: pwsh
         run: |
-          # 用 hashtable splatting 而非字符串数组：@('-SkipBake') 展开时
-          # '-SkipBake' 会被当作位置参数（switch 不生效，PS5.1 静默绑到 OutDir、
-          # PS7 直接报 "positional parameter cannot be found"）。@{SkipBake=$true}
-          # 才能让 [switch] 参数正确生效。
-          $skipArgs = @{}
-          if ("${{ github.event.inputs.skip_bake }}" -eq 'true' -or "${{ github.event_name }}" -eq 'push') { $skipArgs.SkipBake = $true }
-          Write-Host ">>> 参数: $($skipArgs.Keys -join ',')"
-          & "$PWD\tools\build_release.ps1" @skipArgs -OutDir "build_out"
-          if ($LASTEXITCODE -ne 0) { throw "build_release.ps1 失败 rc=$LASTEXITCODE" }
+          $skipArgs = @{ SkipBake = $true }
+          if ('${{ github.event.inputs.skip_dll }}' -eq 'true') { $skipArgs.SkipDll = $true }
+          Write-Host ">>> args: $($skipArgs.Keys -join ',')"
+          & "$PWD/tools/build_release.ps1" @skipArgs -OutDir "build_out"
+          if ($LASTEXITCODE -ne 0) { throw "build_release.ps1 failed rc=$LASTEXITCODE" }
 
-      # ── 产物体积闸门：杜绝错 DLL 流入发布 ────────────────────────────
-      # 正确 v141_xp asi = 144384B；若 CI 静默回退到 v142 会产出 143872B（错误），
-      # 这里在上传前断言两个 asi 体积都正确，异常则直接失败、绝不发错包。
-      - name: 校验 asi 体积（必须为 144384B v141_xp）
-        shell: pwsh
+      # ── 产物体积闸门：杜绝错 DLL 流入发布 ──────────────────────────
+      # 正确 v141 (14.16) + SDK 26100 asi = **144384B**；若编译器回退 v142
+      # 会产出 143872B（错误）。上传前断言两个 zip 内 asi 体积必须精确匹配，
+      # 异常直接失败、绝不发错包。（python zipfile 实现 —— 原 pwsh 版用的
+      # ComObject Shell.Application 在 linux 不可用。）
+      - name: 校验 asi 体积（必须为 144384B v141）
         run: |
-          $want = 144384
-          foreach ($z in @('build_out/MajestyII-CHS-*.zip','build_out/MajestyII-CHT-*.zip')) {
-            $zip = Get-Item $z -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $zip) { throw "找不到构建产物: $z" }
-            # 在 zip 内定位 asi（update/MajestyII_GB18030_2000.asi）
-            $shell = New-Object -ComObject Shell.Application
-            $zp = $shell.NameSpace($zip.FullName)
-            $entry = $zp.Items() | ForEach-Object { $zp.GetDetailsOf($_, 0) } | Where-Object { $_ -match 'MajestyII_GB18030_2000\.asi$' } | Select-Object -First 1
-            if (-not $entry) { throw "未在 $($zip.Name) 内找到 MajestyII_GB18030_2000.asi" }
-            # 通过临时解压读取精确字节大小
-            $tmp = Join-Path $env:TEMP ("asi_$(Get-Random)")
-            New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-            try {
-              Expand-Archive -Path $zip.FullName -DestinationPath $tmp -Force
-              $asi = Get-ChildItem $tmp -Recurse -Filter 'MajestyII_GB18030_2000.asi' | Select-Object -First 1
-              if (-not $asi) { throw "解压后未找到 asi: $($zip.Name)" }
-              $sz = $asi.Length
-              if ($sz -ne $want) { throw "asi 体积错误: $($asi.Name) = $sz B（应为 $want B，疑似 v142 回退）" }
-              Write-Host "✓ $($zip.Name) -> asi $sz B"
-            } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-          }
+          python3 - <<'EOF'
+          import glob, sys, zipfile
+          want = 144384
+          ok = True
+          for pat in ('build_out/MajestyII-CHS-*.zip', 'build_out/MajestyII-CHT-*.zip'):
+              zips = glob.glob(pat)
+              if len(zips) != 1:
+                  print('!! %s: 期望 1 个 zip，实际 %d 个' % (pat, len(zips))); ok = False; continue
+              with zipfile.ZipFile(zips[0]) as z:
+                  infos = [i for i in z.infolist() if i.filename.endswith('MajestyII_GB18030_2000.asi')]
+                  if len(infos) != 1:
+                      print('!! %s: asi 条目 %d 个' % (zips[0], len(infos))); ok = False; continue
+                  sz = infos[0].file_size
+                  if sz != want:
+                      print('!! %s: asi = %d B（应为 %d B，疑似工具集/SDK 回退）'
+                            % (zips[0], sz, want))
+                      ok = False
+                  else:
+                      print('OK  %s: asi %d B' % (zips[0], sz))
+          sys.exit(0 if ok else 1)
+          EOF
 
       # ── 上传 Artifact ─────────────────────────────────────────────
       - name: 上传 CHS 发布包

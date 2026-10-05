@@ -105,11 +105,8 @@ TUVBASE 4096 4096
 | `repack_texts.py` | 重打包 `texts.zip`；**内置 slot0 步进压缩**（幂等、双保险） |
 | `fix_charlist_endian.py` | 字表端序修正（小端字 `L = 首字节 \| 次字节<<8`） |
 | `gen_full_gb18030.py` | 生成完整 GB18030 追加段 |
-| `fix_space_wrap.py` | 字典补空格 + 压空格步进 + 重打包（简繁通用） |
 | `blank_slot223_tuv.py` | 修补 TUV 的 `slot 223` |
-| `audit_coverage.py` / `final_audit.py` | 覆盖率 / 终检 |
-| `verify_atlas_slots.py` | 校验贴图槽顺序 == DLL 字表顺序 |
-| `_archive/` | 一次性脚本与旧日志（考古用） |
+| `../archives/fontgen_archive/` | 一次性脚本与旧日志（考古用，含已退役的 `fix_space_wrap.py` 等） |
 
 ---
 

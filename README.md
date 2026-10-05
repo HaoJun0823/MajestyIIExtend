@@ -33,9 +33,19 @@ build.bat
 
 ### 字典处理（补空格 / 压空格步进 / 重打包 zip）
 
+> `fix_space_wrap.py` 已退役并移入 `archives/fontgen_archive/oneoff_scripts/`。
+> 现行机制是 **DLL 侧动态补空格**：`dllmain.cpp` 的 `RespaceCJK_GBK()`
+> 在 `LoadDict` 时给每个汉字后插入 ASCII 空格，提供引擎断行点（提交 `ef06f46`）。
+
+### 改了字体配置，要重烘字库（必需的第一步）
+
 ```bash
-python fontgen/fix_space_wrap.py --dict <字典路径>
+cd fontgen
+python build_font_atlas.py font_fromscratch.yaml   # 约 3m30s，产出 out_fromscratch/
 ```
+
+> ⚠️ `out_fromscratch/` 属构建产物，2026-10-02 整理时已删除（省 544MB）。
+> `repack_texts.py` 依赖它，重打包 texts.zip 前**必须先烘**。
 
 ---
 
@@ -58,7 +68,7 @@ python fontgen/fix_space_wrap.py --dict <字典路径>
 | `MajestyII_UTF8/` | DLL 源码（`dllmain.cpp` / `charlist_data.h` / vcxproj） |
 | `fontgen/` | 字库生成工具链（Python） |
 | `build_deploy.sh` / `build.bat` | 一键编译 + 部署 |
-| `_archive/` | 历史脚本与旧日志归档（考古用，不参与构建） |
+| `archives/` | 归档区：历史脚本 / 旧日志 / 已退役的 QA 工具链（考古用，不参与构建、不入 git） |
 | `.workbuddy/memory/` | 项目工作记忆 |
 
 ## 环境依赖

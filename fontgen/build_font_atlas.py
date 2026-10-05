@@ -38,6 +38,19 @@ B. 从零生成模式（旧版）：不提供 source_dds/source_tuv 时，从空
     python build_font_atlas.py [配置文件路径]
 默认读取脚本同目录下的 font_config.yaml。也支持 .json。ini 已弃用。
 相对路径均相对于配置文件所在目录；绝对路径原样使用。
+
+【尺寸硬上限】
+   游戏引擎支持的最大纹理为 4096×4096。本脚本在任何模式下都不会让图集
+   的宽度或高度超过 MAX_ATLAS_DIM（= 4096）。超出时会打印警告并钳制，
+   避免引擎丢弃/截断纹理导致追加的汉字不可见。
+
+【字符过滤 / 自适应图集（节省贴图，针对 32 位进程内存上限）】
+   在 from_scratch 模式下，若配置提供 `used_chars_txt`（GB18030 编码，内容为游戏
+   里实际出现的全部文字），则只渲染「出现在该 txt 中」的汉字；其余汉字仍在 TUV 中
+   保留槽位、但坐标写为 0 0 0 0（引擎画空、不显示方框），DDS 只打包有效字形 ——
+   贴图体积大幅下降（例如 23940 字 → 仅实际用到的几千字）。
+   开启该特性时，atlas_width/atlas_height 的 4096 固定值被忽略，改为从 1024 起自适应
+   （按有效字数选最小的 2 的幂画布，仍受 MAX_ATLAS_DIM=4096 上限约束）。
 ================================================================================
 """
 import os
@@ -57,6 +70,12 @@ if importlib.util.find_spec("PIL") is None:
     print("缺少 Pillow(PIL) 库，请执行:  pip install Pillow")
     sys.exit(1)
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+# ---------------------------------------------------------------------------
+# 图集尺寸硬上限（游戏引擎上限 4096×4096，任何维度都不得超过）
+# 之前某些路径会无脑翻倍（如高度翻倍可能到 8192），导致纹理被引擎丢弃/截断。
+# ---------------------------------------------------------------------------
+MAX_ATLAS_DIM = 4096
 
 # ---------------------------------------------------------------------------
 # 配置加载
@@ -127,6 +146,8 @@ def normalize_config(raw, cfg_path):
         "codepoint_grid": bool(raw.get("codepoint_grid", False)),
         "grid_start": int(str(raw.get("grid_start", "0x4E00")), 0),
         "grid_end": int(str(raw.get("grid_end", "0x9FFF")), 0),
+        # 字符过滤：GB18030 编码的 txt（游戏实际出现的文字）；提供则只渲染用到的字
+        "used_chars_txt": rel(raw.get("used_chars_txt", "")),
     }
 
     norm_fonts = []
@@ -183,6 +204,9 @@ def normalize_config(raw, cfg_path):
         # 追加模式默认输出前缀 = 原始 DDS 名字
         if not fc["out_prefix"] and fc["source_dds"]:
             fc["out_prefix"] = os.path.splitext(os.path.basename(fc["source_dds"]))[0]
+        # 字符过滤 txt：per-font 覆盖全局（相对路径按配置目录展开）
+        _uct = f.get("used_chars_txt")
+        fc["used_chars_txt"] = rel(_uct) if _uct else g["used_chars_txt"]
         norm_fonts.append(fc)
 
     # 解析每个字体的 ttf_chain 路径（defaults 已合并进 fc，这里只做路径展开）
@@ -196,6 +220,9 @@ def normalize_config(raw, cfg_path):
         raise ValueError("配置中没有 fonts 列表，至少需要一个字体条目")
     if g["atlas_width"] <= 0 or g["atlas_width"] % 512 != 0:
         raise ValueError("atlas_width 必须是 512 的正整数倍（追加模式不使用，但保留校验）")
+    if g["atlas_width"] > MAX_ATLAS_DIM or g["atlas_height"] > MAX_ATLAS_DIM:
+        print(f"[配置] ⚠ atlas_width/atlas_height 超过游戏上限 {MAX_ATLAS_DIM}，"
+              f"生成时将强制钳制")
 
     g["fonts"] = norm_fonts
     g["_cfg_dir"] = cfg_dir
@@ -655,9 +682,18 @@ def pack_atlas(glyph_list, atlas_width=2048, padding=1):
             row_max_h = 0
             if cy + h > atlas.height:
                 nh = ((cy + h + 511) // 512) * 512
+                # 游戏硬上限：任何维度不得超过 MAX_ATLAS_DIM
+                if nh > MAX_ATLAS_DIM:
+                    nh = MAX_ATLAS_DIM
                 nc = Image.new("L", (atlas_width, nh), 0)
                 nc.paste(atlas, (0, 0))
                 atlas = nc
+        # 已到上限仍放不下 → 写空槽，避免 paste 越界
+        if cy + h > MAX_ATLAS_DIM or cx + w > atlas_width:
+            coord_list.append((0, 0, 0, 0))
+            cx += w + padding
+            row_max_h = max(row_max_h, h)
+            continue
         box = (cx, cy, cx + w, cy + h)
         atlas.paste(glyph, box)
         coord_list.append(box)
@@ -665,6 +701,8 @@ def pack_atlas(glyph_list, atlas_width=2048, padding=1):
         row_max_h = max(row_max_h, h)
     final_h = cy + row_max_h
     actual_h = max(atlas.height, ((final_h + 511) // 512) * 512)
+    if actual_h > MAX_ATLAS_DIM:
+        actual_h = MAX_ATLAS_DIM
     if actual_h < atlas.height:
         atlas = atlas.crop((0, 0, atlas_width, actual_h))
     elif actual_h > atlas.height:
@@ -786,6 +824,9 @@ def build_append(g, fc):
     else:
         base_img, base_header = load_dds_rgba(src_dds)
     base_w, base_h = base_img.size
+    if base_w > MAX_ATLAS_DIM or base_h > MAX_ATLAS_DIM:
+        print(f"  ✗ 原始 DDS {base_w}×{base_h} 已超过游戏上限 {MAX_ATLAS_DIM}，无法继续")
+        return False
     base_count, base_lines = read_tuv(src_tuv)
     base_total0 = base_count
 
@@ -816,17 +857,35 @@ def build_append(g, fc):
     # 画布：宽度用 2 的幂（默认 2048，与正确字库一致），高度取 2 的幂
     # 老游戏 D3D9 引擎对非 2 的幂纹理高度会钳制/截断，导致 y≥原高的追加区不可见
     canvas_w = max(int(fc.get("atlas_width") or g.get("atlas_width", 2048)), base_w)
+    # 游戏硬上限：任何维度不得超过 MAX_ATLAS_DIM
+    if canvas_w > MAX_ATLAS_DIM:
+        print(f"  ⚠ 画布宽 {canvas_w} 超过游戏上限 {MAX_ATLAS_DIM}，已强制钳制"
+              f"（超出部分字形可能被裁切）")
+        canvas_w = MAX_ATLAS_DIM
     new_coords, needed_h = pack_appended(canvas_w, glyphs, base_h, g["padding"])
     final_h = max(base_h, needed_h)
     p2 = 64
     while p2 < final_h:
         p2 <<= 1
+    if p2 > MAX_ATLAS_DIM:
+        print(f"  ⚠ 追加后图集高 {p2} 超过游戏上限 {MAX_ATLAS_DIM}，已强制钳制"
+              f"（部分中文字形可能不可见；建议缩小字号或改用字表模式）")
+        p2 = MAX_ATLAS_DIM
     final_h = p2
     ext = Image.new("RGBA", (canvas_w, final_h), (255, 255, 255, 0))
     ext.paste(base_img, (0, 0))
+    dropped = 0
     for (ch, img, w, h), (x1, y1, x2, y2) in zip(glyphs, new_coords):
         if img is not None and x2 - x1 > 0 and y2 - y1 > 0:
+            if x2 > canvas_w or y2 > final_h:
+                # 被上限截断：写空槽并在 TUV 里改为 0 0 0 0，避免显示花屏
+                dropped += 1
+                idx = new_coords.index((x1, y1, x2, y2))
+                new_coords[idx] = (0, 0, 0, 0)
+                continue
             ext.paste(img, (x1, y1))
+    if dropped:
+        print(f"  ⚠ 有 {dropped} 个字形因超出 {MAX_ATLAS_DIM} 上限被丢弃（写空槽）")
 
     os.makedirs(g["output_dir"], exist_ok=True)
     tuv_name = fc.get("tuv_out") or prefix
@@ -984,10 +1043,12 @@ def write_tuv_scratch(path, char_list, coords, w, h, zero_space_width=False,
 
 
 def pack_atlas_rgba(glyph_list, atlas_width=2048, atlas_height=2048, padding=1):
-    """RGBA 货架打包：把字形逐个贴进 atlas_width×atlas_height 画布，返回画布与坐标。"""
+    """RGBA 货架打包：把字形逐个贴进 atlas_width×atlas_height 画布，返回画布与坐标。
+    任何维度都不会超过 MAX_ATLAS_DIM（游戏上限 4096）。"""
     coord_list = []
     atlas = Image.new("RGBA", (atlas_width, atlas_height), (0, 0, 0, 0))
     cx, cy, row_max_h = 0, 0, 0
+    dropped = 0
     for _, glyph, w, h in glyph_list:
         if glyph is None:
             coord_list.append((0, 0, 0, 0))
@@ -1000,9 +1061,19 @@ def pack_atlas_rgba(glyph_list, atlas_width=2048, atlas_height=2048, padding=1):
                 nh = atlas.height * 2
                 while nh < cy + h:
                     nh *= 2
+                # 游戏硬上限：任何维度不得超过 MAX_ATLAS_DIM
+                if nh > MAX_ATLAS_DIM:
+                    nh = MAX_ATLAS_DIM
                 nc = Image.new("RGBA", (atlas_width, nh), (0, 0, 0, 0))
                 nc.paste(atlas, (0, 0))
                 atlas = nc
+        # 超出上限 → 写空槽，不 paste
+        if cy + h > MAX_ATLAS_DIM or cx + w > atlas_width:
+            coord_list.append((0, 0, 0, 0))
+            cx += w + padding
+            row_max_h = max(row_max_h, h)
+            dropped += 1
+            continue
         box = (cx, cy, cx + w, cy + h)
         # 直接按 RGBA 拷贝（不带 mask）：避免 PIL 把白字按 alpha 预乘到透明黑底
         # 产生灰边（‘白色不纯’）。字形包围盒以 padding 分隔，互不重叠，安全。
@@ -1010,6 +1081,8 @@ def pack_atlas_rgba(glyph_list, atlas_width=2048, atlas_height=2048, padding=1):
         coord_list.append(box)
         cx += w + padding
         row_max_h = max(row_max_h, h)
+    if dropped:
+        print(f"      ⚠ 有 {dropped} 个字形因超出 {MAX_ATLAS_DIM} 上限被丢弃（写空槽）")
     return atlas, coord_list
 
 
@@ -1030,6 +1103,22 @@ def read_charlist_bytes(path):
             chars.append(ch)
         i += 2
     return chars
+
+
+def read_gb18030_used(path):
+    """读取 GB18030 编码的 txt（游戏里实际出现的全部文字），返回去重后的字符集合。
+    用于「只渲染用到的字」以大幅压缩贴图：出现在集合中的汉字才渲染进 DDS，
+    其余汉字保留 TUV 槽位但坐标写 0 0 0 0（引擎画空）。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        text = raw.decode("gb18030")
+    except Exception:
+        text = raw.decode("gb18030", "ignore")
+    if text.startswith("\ufeff"):           # 剥离可能混入的 UTF-8 BOM
+        text = text[1:]
+    skip = set("\r\n\t\x0c\x00\x0b\x08")
+    return set(c for c in text if c not in skip)
 
 
 def read_dll_charlist(dll_cpp):
@@ -1062,20 +1151,32 @@ def _next_pow2(x):
     return p
 
 
-def _compute_atlas_dims(n_glyphs, cell, width0, height0, max_dim=8192):
-    """根据字形总数与单元尺寸，自动选一块够大的 2 的幂画布（行优先货架打包）。"""
-    W = width0
+def _compute_atlas_dims(n_glyphs, cell, width0, height0, max_dim=MAX_ATLAS_DIM):
+    """根据字形总数与单元尺寸，自动选一块够大的 2 的幂画布（行优先货架打包）。
+    任何维度（宽/高）都不会超过 max_dim（游戏上限 4096）。"""
+    W = max(1, int(width0))
+    if W > max_dim:
+        print(f"  ⚠ 起始画布宽 {W} 超过游戏上限 {max_dim}，已强制钳制")
+        W = max_dim
     while True:
         cols = max(1, W // cell)
-        rows = math.ceil(n_glyphs / cols)
+        rows = math.ceil(n_glyphs / cols) if n_glyphs > 0 else 0
         need_h = rows * cell
         if need_h <= max_dim:
             break
         if W >= max_dim:
             break
-        W *= 2
-    init_h = _next_pow2(max(need_h, height0))
-    init_h = min(init_h, max_dim)
+        W = min(W * 2, max_dim)
+    # 在最终 W 下重新计算所需高度
+    cols = max(1, W // cell)
+    rows = math.ceil(n_glyphs / cols) if n_glyphs > 0 else 0
+    need_h = rows * cell
+    init_h = _next_pow2(max(need_h, height0, 64))
+    if init_h > max_dim:
+        init_h = max_dim
+    if need_h > max_dim:
+        print(f"  ⚠ 图集空间不足：{n_glyphs} 个字形 @ {cell}px 需要高 {need_h}px，"
+              f"已钳制到上限 {max_dim}px；超出部分字形将被裁切（写空槽）")
     return W, init_h
 
 
@@ -1214,15 +1315,40 @@ def build_from_scratch(g, fc):
         print(f"      范围模式：0x{start_code:02X} ~ 0x{end_code:02X}（共 {len(all_char)} 个）")
 
     n_chars = len(all_char)
-    if n_chars > 4096 and not is_charlist:
+
+    # ---- 字符过滤：只渲染「游戏实际用到的字」----
+    used_txt = fc.get("used_chars_txt", "")
+    filter_used = False
+    used_set = None
+    if used_txt:
+        if not os.path.isfile(used_txt):
+            # 🔴 配置指明了过滤字集却找不到：必须明确报错，禁止静默退回全量
+            #    （否则会出现「以为过滤了、实际 23940 全字符集」的隐蔽失败）
+            raise FileNotFoundError(
+                f"[used_chars_txt] 配置指定了过滤字集文件，但找不到：\n"
+                f"    解析路径 = {os.path.abspath(used_txt)}\n"
+                f"    相对路径基于配置文件所在目录。请检查文件名/路径是否正确；\n"
+                f"    若确实要渲染全量字库，请删除 yaml 中的 used_chars_txt 配置。")
+        filter_used = True
+        used_set = read_gb18030_used(used_txt)
+        print(f"      字符过滤开启：used_chars_txt = {os.path.basename(used_txt)}"
+              f"（去重用字 {len(used_set)} 个）")
+
+    if n_chars > 4096 and not is_charlist and not filter_used:
         print(f"  ⚠ 字符数 {n_chars} 较大（>4096）。全量 BMP 渲染会生成超大贴图，"
               f"游戏很可能无法加载；中文正确做法是改用字表/追加模式只渲染实际出现的字。")
 
     glyph_list = []
     empty_codes = []
+    filtered_count = 0
     for idx, ch in enumerate(all_char):
         # 仅拉丁区(前 224 个)有真实码点，用于特殊码判定；CJK 区只有槽位序号
         code = (0x20 + idx) if idx < LATIN_N else None
+        # 字符过滤：仅渲染「实际用到」的汉字，其余写空槽（TUV 仍保留全量槽位对齐）
+        if filter_used and idx >= LATIN_N and ch not in used_set:
+            glyph_list.append((ch, None, 0, 0))
+            filtered_count += 1
+            continue
         if code is not None and code in special and src_img is not None and src_coords is not None:
             # 特殊码始终在原始 tuv 的 0x20 起坐标系里（src_coords 行号 = 0x20 + i）
             src_idx = code - 0x20
@@ -1255,9 +1381,17 @@ def build_from_scratch(g, fc):
             else:
                 glyph_list.append((ch, img, w, h))
 
-    # 自动计算画布尺寸（行优先货架打包），避免小画布溢出或浪费空间
+    # 自动计算画布尺寸（行优先货架打包），避免小画布溢出或浪费空间。
+    # 字符过滤时按「有效字形数」计算，并从 1024 起自适应（忽略 yaml 的 4096 固定值）。
+    n_effective = sum(1 for (_, img, _, _) in glyph_list if img is not None)
+    if filter_used:
+        print(f"      有效字形 {n_effective} 个（全量 {n_chars}，因过滤写空槽 {filtered_count} 个）")
     cell = font_size + 2 * g["padding"] + 4 + (2 if outline else 0)
-    W, init_h = _compute_atlas_dims(n_chars, max(cell, 1), g["atlas_width"], g["atlas_height"])
+    if filter_used:
+        start_w = start_h = 1024
+    else:
+        start_w, start_h = g["atlas_width"], g["atlas_height"]
+    W, init_h = _compute_atlas_dims(n_effective, max(cell, 1), start_w, start_h)
     atlas, coords = pack_atlas_rgba(glyph_list, W, init_h, g["padding"])
 
     os.makedirs(g["output_dir"], exist_ok=True)
@@ -1442,6 +1576,7 @@ def main():
     print(" 输出目录：", os.path.abspath(cfg["output_dir"]))
     print(" 字符库   ：", os.path.abspath(cfg["charlist"]))
     print(" 字体套数 ：", len(cfg["fonts"]))
+    print(f" 尺寸上限 ： {MAX_ATLAS_DIM}×{MAX_ATLAS_DIM}")
     print("=" * 64)
 
     ok = active = skipped = 0

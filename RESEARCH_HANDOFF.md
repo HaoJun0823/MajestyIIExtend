@@ -342,20 +342,30 @@ G:\Projects\MajestyIIExtend\
 │   ├── charlist_data.h           # 字表（23940 项小端字，自动生成）
 │   ├── MajestyII_UTF8.vcxproj    # v141 / Win32 / DLL / /utf-8
 │   ├── framework.h / pch.h / pch.cpp
-│   └── _archive/bak/             # 旧 .bak 归档
+│   └── (旧 .bak 已并入 archives/)
 ├── fontgen\
 │   ├── build_font_atlas.py       # ★ 字库生成器（追加 / from_scratch 双模式）
 │   ├── font_fromscratch.yaml     # ★ 当前生产配置（19 套字体）
 │   ├── repack_texts.py           # ★ 重打包 texts.zip（内置 slot0 压缩）
 │   ├── fix_charlist_endian.py    # 字表端序修正
-│   ├── fix_space_wrap.py         # 字典补空格 + 压空格 + 重打包
-│   ├── out_fromscratch\          # 构建产物（不入 git，496MB）
-│   ├── original_dds\             # 原版参考字库（不入 git，25MB）
-│   └── _archive\                 # 一次性脚本 / 旧日志归档
-├── _archive\.temp_hist\          # 历史 .temp 脚本归档
-├── Release\ / packages\ / pakcrypt\
+│   ├── out_fromscratch\          # 构建产物（不入 git；★2026-10-02 已清理，需重烘）
+│   └── original_dds\             # 原版参考字库（不入 git，25MB）
+├── archives\                     # ★ 统一归档区（不入 git，25MB）
+│   ├── .temp_hist\               # 历史 .temp 脚本 + merged 源码/DLL
+│   ├── fontgen_archive\          # fontgen 一次性脚本 / 旧日志
+│   ├── loc_qa\                   # 词典 QA 工具链（172 文件，2026-10-02 归档）
+│   └── pakcrypt\                 # pak 解密探针
+├── packages\                     # NuGet（MinHook）缓存，不入 git
 └── .workbuddy\memory\            # 项目记忆（不入 git）
 ```
+
+> ★ **2026-10-02 仓库整理**：`_archive/` 统一改名为 `archives/`，原
+> `fontgen/_archive/`、`loc_qa/`、`pakcrypt/` 一并归入该区。
+> 同时删除了纯垃圾：`.vs/`(128M)、`Release/`、`MajestyII_UTF8/Release/`、
+> `*.obj`/`*.dll`、两个 `__pycache__`、以及 `fontgen/out_fromscratch*`（544MB）。
+> ⚠️ **字库产物已删** —— `repack_texts.py` 依赖 `out_fromscratch/` 里的 TUV+DDS，
+> 需先跑 `python fontgen/build_font_atlas.py font_fromscratch.yaml`（约 3m30s）
+> 才能重打包 texts.zip。仓库体积 852MB → 178MB。
 
 ---
 
@@ -411,7 +421,7 @@ python fontgen/audit_coverage.py
 4. **构建脚本已统一**：`build_deploy.sh`（Git Bash，**已实测通过**）与
    `build.bat`（cmd，结构等价）是仅有的两套入口，
    `MajestyII_UTF8/build_asi.ps1` 为冗余第三套（用 BuildTools 路径 + SDK 19041），
-   **已归档到 `_archive/build_asi.ps1.redundant`**，不建议再用。
+   **已归档到 `archives/build_asi.ps1.redundant`**，不建议再用。
 
 > 注：本机环境无法从自动化工具直接调 `cmd.exe` / PowerShell 跑 cl.exe，
 > 所以 `build.bat` 只做了结构复核（与 `.sh` 同一 cl、同一 flags、同一 Windows 路径），
