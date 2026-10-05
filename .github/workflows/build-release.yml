@@ -130,7 +130,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .msvc
-          key: mj2-msvcwine-v141-x86-sdk26100-${{ env.MSVCWINE_REF }}-v1
+          key: mj2-msvcwine-v141-x86-sdk26100-${{ env.MSVCWINE_REF }}-v2
 
       # ── 下载工具链（缓存未命中时）：两段 vsdownload + 合并 ──────────
       #   ★ 段 1（VC 14.16）：--major 15 是**关键** —— Microsoft.VisualStudio.
@@ -138,12 +138,17 @@ jobs:
       #     清单里 v141 兼容组件 ID 不同（VC.v141.x86.x64），vsdownload 找
       #     不到会**静默回退最新工具集**（v143 之类），故必须锁 15。
       #     --with-sdk=no：SDK 走段 2，这里不装 17763，省 ~500MB。
+      #   ★★ --architecture **x86 x64**（两者都要）—— 不是只 x86：
+      #     x86 cl.exe（Hostx64/x86，64 位宿主进程编 32 位目标）启动时按 PATH
+      #     找 mspdbcore.dll，而 VC 14.16 里 mspdbcore.dll 只存在于
+      #     Hostx64/x64 目录（x86 目标目录不自带）。只拉 x86 会让 wine 下
+      #     的 cl 报 "fatal error C1356: unable to find mspdbcore.dll"
+      #     （实测 run 首轮踩坑）。msvcenv.sh 的 WINEPATH 末尾会追加
+      #     Hostx64/x64 兜底，但前提是该目录被下载下来 —— 故这里必须把
+      #     x64 也纳入。SR_GAME_CHINESE（x64 目标）无此问题因它本就要 x64。
       #   ★ 段 2（SDK 26100）：保 144384B 体积指纹的必要条件。VS2022
       #     manifest 里按 --sdk-version 10.0.26100 精确选中；
       #     --with-default=no 防止把整个 VCTools workload 连带拉下来。
-      #     vsdownload.py 内部对 17.14 的默认 SDK 恰是 10.0.26100，匹配逻辑
-      #     是 msvc-wine 官方维护的路径；若上游 ID 变化，此步会打印
-      #     "Available versions" 列表，按日志改版本号即可。
       #   ★ 合并：mv .msvc-sdk/Windows\ Kits -> .msvc/（VC 段没装 SDK，
       #     该位置是空的，直接 mv）。install.sh 探测 SDKVER 时 26100 是
       #     唯一版本，自动选中。
@@ -153,10 +158,10 @@ jobs:
           if [ -x "${MSVC_WINE_PREFIX}/bin/x86/cl" ] && [ -d "${MSVC_WINE_PREFIX}/kits/10/include/10.0.26100.0" ]; then
             echo "工具链缓存命中（VC 14.16 + SDK 26100），跳过下载。"
           else
-            echo "==> [1/3] 下载 VC 14.16 (v141, VS2017 channel)"
+            echo "==> [1/3] 下载 VC 14.16 (v141, VS2017 channel, x86+x64)"
             python3 .msvc-wine/vsdownload.py \
               --accept-license --major 15 --msvc-version 15.9 \
-              --architecture x86 --host-arch x64 \
+              --architecture x86 x64 --host-arch x64 \
               --with-sdk=no --with-atl=no --with-asan=no --with-dia=no \
               --with-msbuild=no --with-devcmd=no \
               --dest "${MSVC_WINE_PREFIX}"
@@ -192,12 +197,16 @@ jobs:
       #   目标），banner 形如 "... Version 19.16.x for x86"。**必须**看到
       #   19.16 才放行 —— 防止 vsdownload 参数被上游改动后静默回退新版
       #   工具集（那会产出 143872B 错误 asi，被下方体积闸门拦截）。
+      #   ★ 同时显式检查 mspdbcore.dll 就位（首轮 C1356 的根因诊断）：
+      #     x86 cl.exe 启动时按 WINEPATH 找它，文件在 Hostx64/x64 目录里。
       - name: 验证编译器为 MSVC v141 x86（诊断 + 门禁）
         run: |
           set -euo pipefail
           export PATH="${MSVC_WINE_PREFIX}/bin/x86:$PATH"
-          banner="$(cl 2>&1 || true)"
+          echo "── mspdbcore.dll 就位检查（C1356 根因诊断）──"
+          find "${MSVC_WINE_PREFIX}/vc/tools/msvc" -name mspdbcore.dll 2>/dev/null || true
           echo "── cl banner ──"
+          banner="$(cl 2>&1 || true)"
           echo "$banner" | head -2
           if ! echo "$banner" | grep -q "19\.16"; then
             echo "!! cl 不是 MSVC 14.16 (v141) —— vsdownload 可能回退了版本" >&2
