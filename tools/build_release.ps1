@@ -172,16 +172,19 @@ exit /b %errorlevel%
         Write-Host "asi deployed -> CHS\update & CHT\update"
     }
 } else {
-    Write-Host ">> skip DLL compile (-SkipDll), reusing existing dll"
-    $legacyDll = Join-Path $Repo 'MajestyII_UTF8\MajestyII_UTF8.dll'
-    if (Test-Path $legacyDll) {
+    Write-Host ">> skip DLL compile (-SkipDll), reusing committed asi"
+    # 手动 dispatch 设置 skip_dll=true 时走此分支：复用已提交的 dist/MajestyII_GB18030_2000.asi
+    # （v141_xp 144384B，与 V15 逐字节一致，仅 PE 时间戳不同）；其次回退到 gitignore 的本地 dll。
+    $committedAsi = Join-Path $Repo 'dist\MajestyII_GB18030_2000.asi'
+    $srcDll = if (Test-Path $committedAsi) { $committedAsi } else { Join-Path $Repo 'MajestyII_UTF8\MajestyII_UTF8.dll' }
+    if (Test-Path $srcDll) {
         foreach ($dst in @((Join-Path $CHS 'update\MajestyII_GB18030_2000.asi'),(Join-Path $CHT 'update\MajestyII_GB18030_2000.asi'))) {
             New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
-            Copy-Item $legacyDll $dst -Force
+            Copy-Item $srcDll $dst -Force
         }
-        Write-Host "reused existing dll"
+        Write-Host "reused asi: $srcDll ($( (Get-Item $srcDll).Length ) B)"
     } else {
-        Write-Warning "-SkipDll but no existing dll found; asi will be missing"
+        Write-Warning "-SkipDll but no asi found (no committed dist asi, no local dll); asi will be missing"
     }
 }
 

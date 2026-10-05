@@ -66,12 +66,11 @@ concurrency:
 jobs:
   build:
     name: 构建发布包
-    # v141_xp：windows-2022（VS2022 镜像）已自带 v141(MSVC 14.16) 工具集，
-    # 经 vswhere 发现 14.16 cl.exe 直编即可（参考 cnc-ddraw 在 windows-latest 编
-    # v141_xp，WinXP 组件安装步骤已注释掉 = 镜像自带）。windows-2019 已下架，不能用。
-    # 下方「检查 v141 工具集」步骤在找不到 14.16 时立即失败，杜绝静默回退到 v142
-    # （那会产出错误的 143872B DLL；正确的 v141_xp 产物是 144384B）。
-    runs-on: windows-2022
+    # 用户要求：用 windows-latest 直接从源码编译 v141_xp（不要 windows-2022 特例，
+    # 也不要提交成品 asi）。v141(MSVC 14.16) 需镜像自带；下方「探查 MSVC 工具集」
+    # 打印所有 cl.exe 取证，「校验 asi 体积」闸门（非 144384B 即失败）兜底，
+    # 即使 windows-latest 无 v141 也只会构建失败、绝不会发错包。
+    runs-on: windows-latest
     timeout-minutes: 60
 
     env:
@@ -95,10 +94,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install opencc Pillow freetype-py pyyaml fonttools numpy
 
-      # ── 探查镜像上可用的 MSVC 工具集（诊断用，不再因缺失 v141 硬失败）────
-      # windows-2022 镜像默认不带 v141(MSVC 14.16)；最终是否产出正确 v141_xp DLL
-      # 由下方「校验 asi 体积」闸门兜底（非 144384B 直接失败，绝不发错包）。
-      # 这里只打印所有 cl.exe 供排查，并把发现的 v141 cl.exe 写入 $env，供 build 步优先使用。
+      # ── 探查镜像上可用的 MSVC 工具集（取证用，非致命）─────────────────
+      # 打印所有 cl.exe，确认 windows-latest 是否真带 v141(14.16)。
       - name: 探查 MSVC 工具集
         if: ${{ !cancelled() }}
         shell: pwsh
@@ -108,23 +105,16 @@ jobs:
           if (Test-Path $vsw) {
             & $vsw -all -products * -find 'VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe' 2>$null | ForEach-Object { Write-Host "  $_" }
           }
-          # 也直接扫盘兜底
           Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "  $($_.FullName)" }
-          # 记录是否找到 14.16（v141）
-          $v141 = if (Test-Path $vsw) {
-            & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null | Select-Object -First 1
-          } else { $null }
-          if (-not $v141) {
-            $v141 = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-          if ($v141) { Write-Host "✓ 发现 v141 cl.exe: $v141" } else { Write-Host "⚠ 镜像未预装 v141(14.16)，将依赖 build_release.ps1 的 fallback 或后续安装" }
-          # 暴露给后续步骤（build_release.ps1 内部也用 vswhere 再发现一次）
-          Add-Content -Path $env:GITHUB_ENV -Value "MJ2_V141_CL=$v141"
+          $v141 = if (Test-Path $vsw) { & $vsw -all -products * -find 'VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe' 2>$null | Select-Object -First 1 } else { $null }
+          if (-not $v141) { $v141 = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\VC\Tools\MSVC\14.16*\bin\Hostx86\x86\cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($v141) { Write-Host "✓ 发现 v141 cl.exe: $v141" } else { Write-Host "⚠ 镜像未预装 v141(14.16)，build_release.ps1 将回退 v142 并被体积闸门拦截" }
 
       # ── 核心：装配脚本 ─────────────────────────────────────────────
       # CI 恒用已提交的 fontgen/font_auto_build 成品字库（与 V15 逐字节一致），
       # 不现场重烘焙 —— 从零烘焙在 CI 上会产出 4096 尺寸的错误字库（已被 V15 判定为错）。
+      # DLL 从源码直编（cl.exe），由 v141 cl.exe 产出 144384B 正确 asi。
       - name: 运行 build_release.ps1
         shell: pwsh
         run: |
@@ -134,7 +124,6 @@ jobs:
           # 才能让 [switch] 参数正确生效。
           $skipArgs = @{}
           if ("${{ github.event.inputs.skip_bake }}" -eq 'true' -or "${{ github.event_name }}" -eq 'push') { $skipArgs.SkipBake = $true }
-          if ("${{ github.event.inputs.skip_dll }}" -eq 'true') { $skipArgs.SkipDll = $true }
           Write-Host ">>> 参数: $($skipArgs.Keys -join ',')"
           & "$PWD\tools\build_release.ps1" @skipArgs -OutDir "build_out"
           if ($LASTEXITCODE -ne 0) { throw "build_release.ps1 失败 rc=$LASTEXITCODE" }
