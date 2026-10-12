@@ -285,11 +285,20 @@ if (-not $SkipOpenCC) {
             if ((Get-Item $readmeSrc).Length -gt 0) {
                 New-Item -ItemType Directory -Force -Path (Split-Path $readmeDst -Parent) | Out-Null
                 Convert-File-S2T $readmeSrc $readmeDst 'utf-8' 'utf-8-sig'
+                # ★ OpenCC 会把源文的「简体中文」直译成「簡體中文」，但本包
+                #   是**繁体**版，说明里自称「簡體」是错的。转换后定向改回。
+                $rdTxt = [System.IO.File]::ReadAllText($readmeDst, (New-Object System.Text.UTF8Encoding($true)))
+                $rdFixed = $rdTxt.Replace('簡體中文漢化補丁', '繁體中文漢化補丁')
+                if ($rdFixed -ne $rdTxt) {
+                    [System.IO.File]::WriteAllText($readmeDst, $rdFixed, (New-Object System.Text.UTF8Encoding($true)))
+                    Write-Host "  CHT readme: 簡體中文 -> 繁體中文（本包为繁体版）"
+                }
             } else { Write-Warning "dist\必读说明.txt is 0 bytes; CHT readme left empty (provide content)"
             }
         }
 
         # traditional AI helper files（同样 UTF-8）
+        #   同样把 OpenCC 直译出的「簡體中文」改回「繁體中文」（本包是繁体版）。
         foreach ($ai in @('如果不会安装，请把该文件发给AI，让AI教你.txt',
                           '将此文件交给AI，让AI协助完善本项目.txt')) {
             $aiSrc = Join-Path $Repo "dist\$ai"
@@ -297,6 +306,11 @@ if (-not $SkipOpenCC) {
             if (Test-Path $aiSrc) {
                 New-Item -ItemType Directory -Force -Path (Split-Path $aiDst -Parent) | Out-Null
                 Convert-File-S2T $aiSrc $aiDst 'utf-8' 'utf-8-sig'
+                $aiTxt = [System.IO.File]::ReadAllText($aiDst, (New-Object System.Text.UTF8Encoding($true)))
+                $aiFixed = $aiTxt.Replace('簡體中文', '繁體中文')
+                if ($aiFixed -ne $aiTxt) {
+                    [System.IO.File]::WriteAllText($aiDst, $aiFixed, (New-Object System.Text.UTF8Encoding($true)))
+                }
             } else { Write-Warning "missing $aiSrc" }
         }
     }
