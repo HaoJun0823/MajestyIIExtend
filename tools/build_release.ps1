@@ -12,7 +12,7 @@ Pipeline:
      no CRT, /O2) and rename to MajestyII_GB18030_2000.asi (the name the
      game actually loads)
   3. OpenCC s2t (simplified -> traditional) on Text/DictRead.txt and
-     dist/汉化说明.txt
+     dist/必读说明.txt and the two AI helper files
   4. assemble CHS / CHT release directory trees
   5. verify artifacts (DLL is PE32, asi present, fonts complete, zips valid,
      encoding correct)
@@ -270,14 +270,25 @@ if (-not $SkipOpenCC) {
         } else { Write-Warning "missing $dictSrc; skipping traditional dict" }
 
         # traditional readme
-        $readmeSrc = Join-Path $Repo 'dist\汉化说明.txt'
-        $readmeDst = Join-Path $CHT '汉化说明.txt'
+        $readmeSrc = Join-Path $Repo 'dist\必读说明.txt'
+        $readmeDst = Join-Path $CHT '必读说明.txt'
         if (Test-Path $readmeSrc) {
             if ((Get-Item $readmeSrc).Length -gt 0) {
                 New-Item -ItemType Directory -Force -Path (Split-Path $readmeDst -Parent) | Out-Null
                 Convert-File-S2T $readmeSrc $readmeDst 'GB18030'
-            } else { Write-Warning "dist\汉化说明.txt is 0 bytes; CHT readme left empty (provide content)"
+            } else { Write-Warning "dist\必读说明.txt is 0 bytes; CHT readme left empty (provide content)"
             }
+        }
+
+        # traditional AI helper files
+        foreach ($ai in @('如果不会安装，请把该文件发给AI，让AI教你.txt',
+                          '将此文件交给AI，让AI协助完善本项目.txt')) {
+            $aiSrc = Join-Path $Repo "dist\$ai"
+            $aiDst = Join-Path $CHT $ai
+            if (Test-Path $aiSrc) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $aiDst -Parent) | Out-Null
+                Convert-File-S2T $aiSrc $aiDst 'GB18030'
+            } else { Write-Warning "missing $aiSrc" }
         }
     }
 } else {
@@ -298,22 +309,40 @@ Invoke-Step "STEP 4 · assemble CHS / CHT packages" {
         if (Test-Path $winmm) { Copy-Item $winmm (Join-Path $target 'winmm.dll') -Force }
         else { Write-Warning "missing $winmm" }
 
-        # 4.2 merge License -> License.txt
-        $licDir = Join-Path $Repo 'License'
+        # 4.2 merge LICENSES -> License.txt
+        #     S10 统一：目录名 License/ → LICENSES/；根 LICENSE 另存为包内 LICENSE。
+        $licDir = Join-Path $Repo 'LICENSES'
         $licFiles = Get-ChildItem $licDir -File -ErrorAction SilentlyContinue
         if ($licFiles) {
             $licDst = Join-Path $target 'License.txt'
             Get-Content $licFiles.FullName -Raw -Encoding UTF8 | Out-File $licDst -Encoding UTF8
-        } else { Write-Warning "License/ empty, no License.txt generated" }
+        } else { Write-Warning "LICENSES/ empty, no License.txt generated" }
+
+        # 4.2b 根 LICENSE（项目主许可，含游戏版权声明）→ 包根 LICENSE
+        $rootLic = Join-Path $Repo 'LICENSE'
+        if (Test-Path $rootLic) { Copy-Item $rootLic (Join-Path $target 'LICENSE') -Force }
+        else { Write-Warning "missing $rootLic" }
 
         # 4.3 readme (CHS original, CHT converted in STEP3)
-        $rs = Join-Path $dist '汉化说明.txt'
-        $rd = Join-Path $target '汉化说明.txt'
+        $rs = Join-Path $dist '必读说明.txt'
+        $rd = Join-Path $target '必读说明.txt'
         if (-not $SkipOpenCC -and $lang -eq 'CHT' -and (Test-Path $rd)) {
             # already produced by STEP3
         } elseif (Test-Path $rs) {
             Copy-Item $rs $rd -Force
         } else { Write-Warning "missing $rs" }
+
+        # 4.3b 两份 AI 辅助文件（S12/S13；CHT 已在 STEP3 转好）
+        foreach ($ai in @('如果不会安装，请把该文件发给AI，让AI教你.txt',
+                          '将此文件交给AI，让AI协助完善本项目.txt')) {
+            $as = Join-Path $dist $ai
+            $ad = Join-Path $target $ai
+            if (-not $SkipOpenCC -and $lang -eq 'CHT' -and (Test-Path $ad)) {
+                # already produced by STEP3
+            } elseif (Test-Path $as) {
+                Copy-Item $as $ad -Force
+            } else { Write-Warning "missing $as" }
+        }
 
         # 4.4 update/ dict (CHS = simplified original; CHT = prevailing converted)
         $ud = Join-Path $target 'update'
@@ -527,6 +556,20 @@ Invoke-Step "STEP 5 · verify artifacts" {
             } finally { $z.Dispose() }
         }
         if (-not (Test-Path (Join-Path $t "update/DictRead.txt"))) { $errs += "missing update/DictRead.txt" }
+
+        # S11/S12/S13：包根说明与两份 AI 辅助文件必须存在且非空。
+        # 事故背景：dist\汉化说明.txt 曾长期是 0 字节并被打进包里，
+        # 因这里没有任何校验而一直无人发现。
+        foreach ($f in @('必读说明.txt',
+                         '如果不会安装，请把该文件发给AI，让AI教你.txt',
+                         '将此文件交给AI，让AI协助完善本项目.txt')) {
+            $fp = Join-Path $t $f
+            if (-not (Test-Path $fp)) { $errs += "missing $f" }
+            elseif ((Get-Item $fp).Length -eq 0) { $errs += "$f is 0 bytes" }
+        }
+        # 许可文件（分发义务）
+        if (-not (Test-Path (Join-Path $t "LICENSE"))) { $errs += "missing LICENSE" }
+        if (-not (Test-Path (Join-Path $t "License.txt"))) { $errs += "missing License.txt" }
         foreach ($e in $errs) { Write-Host "  X $e" }
         if ($errs.Count) { throw ("{0} package verification failed: {1} issue(s)" -f $lang, $errs.Count) }
         Write-Host "  OK $lang verification passed"
@@ -563,6 +606,7 @@ Write-Host "     bake from scratch; dict is reused from Text/DictRead.txt"
 Write-Host "     into git for CI to bake from scratch"
 Write-Host " 5) release ships 60FPSLimiter.asi & DictRead_V7_CHT.txt with no repo source;"
 Write-Host "     this script does NOT fabricate them (warns only)"
-Write-Host " 6) dist\汉化说明.txt is currently 0 bytes; packed as-is with a warning"
+Write-Host " 6) dist\必读说明.txt now has real content (was 0 bytes before S11 unification);"
+Write-Host "     STEP 5 hard-fails if it or the AI helpers are missing/empty"
 Write-Host ""
 Write-Host "done."
