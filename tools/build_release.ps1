@@ -233,25 +233,30 @@ exit /b %errorlevel%
 # ============================================================
 # STEP 3 — OpenCC simplified -> traditional
 # ============================================================
-function Convert-File-S2T([string]$src, [string]$dst, [string]$encoding) {
-    # src/dst both GB18030; python opencc converts only CJK, keeps ASCII/tags/structure
+function Convert-File-S2T([string]$src, [string]$dst, [string]$encoding, [string]$outEncoding = '') {
+    # src 按 $encoding 读；dst 按 $outEncoding（省略则同 $encoding）写。
+    # ★ 两者分开是必要的：DictRead.txt 必须保持 GB18030（游戏引擎要求），
+    #   而 dist/ 下的说明与 AI 辅助文件是 UTF-8 —— 用 GB18030 读 UTF-8 会抛
+    #   UnicodeDecodeError（0x81 illegal multibyte sequence，2026-10-12 实测）。
+    #   输出用 utf-8-sig（带 BOM）则保证 Windows 记事本双击打开不乱码。
+    if (-not $outEncoding) { $outEncoding = $encoding }
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("mj2_{0}.py" -f ([guid]::NewGuid().ToString('N')))
     $py = @'
 import sys
 from opencc import OpenCC
 cc = OpenCC('s2t')
-src, dst, enc = sys.argv[1], sys.argv[2], sys.argv[3]
+src, dst, enc, outenc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(src, 'r', encoding=enc) as f:
     text = f.read()
 converted = cc.convert(text)
-with open(dst, 'w', encoding=enc) as f:
+with open(dst, 'w', encoding=outenc) as f:
     f.write(converted)
 print('converted %d chars' % len(converted))
 '@
     $pyBody = $py -replace "`n", "`r`n"
     [System.IO.File]::WriteAllText($tmp, $pyBody, [System.Text.Encoding]::UTF8)
     try {
-        & $PyExe $tmp $src $dst $encoding
+        & $PyExe $tmp $src $dst $encoding $outEncoding
         if ($LASTEXITCODE) { throw "OpenCC conversion failed" }
     } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
@@ -270,24 +275,28 @@ if (-not $SkipOpenCC) {
         } else { Write-Warning "missing $dictSrc; skipping traditional dict" }
 
         # traditional readme
+        # ★ 编码说明：DictRead.txt 是 GB18030（游戏引擎要求，841910B），
+        #   但 dist/ 下的说明与 AI 辅助文件是 **UTF-8**（含 GB18030 无法表示的
+        #   字符，如制表符/书名单引号变体等）。用 GB18030 强读会抛
+        #   UnicodeDecodeError（2026-10-12 实测：0x81 illegal multibyte sequence）。
         $readmeSrc = Join-Path $Repo 'dist\必读说明.txt'
         $readmeDst = Join-Path $CHT '必读说明.txt'
         if (Test-Path $readmeSrc) {
             if ((Get-Item $readmeSrc).Length -gt 0) {
                 New-Item -ItemType Directory -Force -Path (Split-Path $readmeDst -Parent) | Out-Null
-                Convert-File-S2T $readmeSrc $readmeDst 'GB18030'
+                Convert-File-S2T $readmeSrc $readmeDst 'utf-8' 'utf-8-sig'
             } else { Write-Warning "dist\必读说明.txt is 0 bytes; CHT readme left empty (provide content)"
             }
         }
 
-        # traditional AI helper files
+        # traditional AI helper files（同样 UTF-8）
         foreach ($ai in @('如果不会安装，请把该文件发给AI，让AI教你.txt',
                           '将此文件交给AI，让AI协助完善本项目.txt')) {
             $aiSrc = Join-Path $Repo "dist\$ai"
             $aiDst = Join-Path $CHT $ai
             if (Test-Path $aiSrc) {
                 New-Item -ItemType Directory -Force -Path (Split-Path $aiDst -Parent) | Out-Null
-                Convert-File-S2T $aiSrc $aiDst 'GB18030'
+                Convert-File-S2T $aiSrc $aiDst 'utf-8' 'utf-8-sig'
             } else { Write-Warning "missing $aiSrc" }
         }
     }
