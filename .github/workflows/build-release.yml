@@ -400,21 +400,25 @@ jobs:
 
           {
             echo
-            # 简体包优先；若无则退回繁体包的说明
-            readme=""
-            for cand in "dist/mj2-chs/必读说明.txt" "dist/mj2-cht/必读说明.txt"; do
-              if [ -f "$cand" ]; then readme="$cand"; break; fi
+            # ★ 必读说明在 zip 内部（artifact 只上传 zip，不含独立的说明文件），
+            #   故从 zip 里取 —— 这样 Release 正文与玩家实际拿到的包内说明逐字一致。
+            #   简体包优先；无则退回繁体包。
+            readme_embed=""
+            for z in "$zip_chs_path" "$zip_cht_path"; do
+              if unzip -p "$z" '必读说明.txt' 2>/dev/null | tr -d '\r' > readme_embed.txt && [ -s readme_embed.txt ]; then
+                readme_embed="$z"; break
+              fi
             done
-            if [ -n "$readme" ]; then
+            if [ -s readme_embed.txt ]; then
               echo "<details><summary>展开完整必读说明（与包内 必读说明.txt 一致）</summary>"
               echo
               echo "<pre>"
-              tr -d '\r' < "$readme"
+              cat readme_embed.txt
               echo "</pre>"
               echo
               echo "</details>"
             else
-              echo "> ⚠️ 未找到必读说明，本次未附带。"
+              echo "> ⚠️ 未能从 zip 内取出 必读说明.txt，本次未附带。"
             fi
             echo
             echo "---"
