@@ -326,12 +326,18 @@ jobs:
           slug="${{ github.repository }}"
           repo_url="https://github.com/$slug"
 
-          # 附件名即本地 zip 名（glob 上传原样保留），动态取出以免与实际不符
-          zip_chs="$(basename "$(ls dist/mj2-chs/MajestyII-CHS-*.zip 2>/dev/null | head -1)")"
-          zip_cht="$(basename "$(ls dist/mj2-cht/MajestyII-CHT-*.zip 2>/dev/null | head -1)")"
-          if [ -z "$zip_chs" ] || [ -z "$zip_cht" ]; then
-            echo "!! 未找到 CHS/CHT zip" >&2; exit 1
+          # 附件名即本地 zip 名（glob 上传原样保留）。
+          # ★ 用 find 而非硬编码 dist/<artifact>/：download-artifact 大版本之间
+          #   落盘层级会变（v4 → v8 实测不同），find 对两种布局都成立。
+          zip_chs_path="$(find dist -name 'MajestyII-CHS-*.zip' -print -quit 2>/dev/null || true)"
+          zip_cht_path="$(find dist -name 'MajestyII-CHT-*.zip' -print -quit 2>/dev/null || true)"
+          if [ -z "$zip_chs_path" ] || [ -z "$zip_cht_path" ]; then
+            echo "!! 未找到 CHS/CHT zip；dist 实际内容：" >&2
+            ls -R dist >&2 || true
+            exit 1
           fi
+          zip_chs="$(basename "$zip_chs_path")"
+          zip_cht="$(basename "$zip_cht_path")"
 
           # 提交范围：自上次 Release 的 commit 起。
           # ★ 不用 git log <上次tag>..HEAD：checkout 默认不拉 tag 对象，会报 unknown revision。
@@ -441,9 +447,18 @@ jobs:
           # 用 GITHUB_TOKEN 建 tag 不会触发新的 on:push run；直接 gh release create。
           # gh release create 需要 tag 已在远端；本地 git tag 后再 push 太慢，
           # 直接 --target 指向当前 commit SHA 由 gh 代建远端 tag。
+          # 同上：用 find 定位，兼容 download-artifact 的落盘层级差异
+          zip_chs_path="$(find dist -name 'MajestyII-CHS-*.zip' -print -quit 2>/dev/null || true)"
+          zip_cht_path="$(find dist -name 'MajestyII-CHT-*.zip' -print -quit 2>/dev/null || true)"
+          if [ -z "$zip_chs_path" ] || [ -z "$zip_cht_path" ]; then
+            echo "!! 未找到 CHS/CHT zip；dist 实际内容：" >&2
+            ls -R dist >&2 || true
+            exit 1
+          fi
+
           gh release create "$tag" \
-            "dist/mj2-chs/MajestyII-CHS-"*.zip \
-            "dist/mj2-cht/MajestyII-CHT-"*.zip \
+            "$zip_chs_path" \
+            "$zip_cht_path" \
             --target "$GITHUB_SHA" \
             --title "Majesty II 汉化补丁 $tag" \
             --notes-file release_notes.md
